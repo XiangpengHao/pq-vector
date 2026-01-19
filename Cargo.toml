@@ -1,0 +1,9 @@
+[package]
+name = "pg-vector"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alp = "0.0.1"
+arrow = "57.2.0"
+parquet = "57.2.0"
