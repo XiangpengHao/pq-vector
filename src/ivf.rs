@@ -11,7 +11,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
-use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::reader::FileReader;
+use parquet::file::serialized_reader::SerializedFileReader;
 use rand::Rng;
 use rand::SeedableRng;
 use std::cmp::Ordering;
@@ -202,11 +203,6 @@ pub fn build_index(
         .n_clusters
         .unwrap_or_else(|| (n_vectors as f64).sqrt().ceil() as usize);
 
-    println!(
-        "Building IVF index: {} vectors, dim={}, k={}",
-        n_vectors, dim, n_clusters
-    );
-
     // Run k-means clustering
     let (centroids, assignments) =
         kmeans(&embeddings, dim, n_clusters, params.max_iters, params.seed);
@@ -216,15 +212,6 @@ pub fn build_index(
     for (row_idx, &cluster_idx) in assignments.iter().enumerate() {
         inverted_lists[cluster_idx].push(row_idx as u32);
     }
-
-    // Print cluster sizes
-    let sizes: Vec<usize> = inverted_lists.iter().map(|l| l.len()).collect();
-    println!(
-        "Cluster sizes: min={}, max={}, avg={:.1}",
-        sizes.iter().min().unwrap_or(&0),
-        sizes.iter().max().unwrap_or(&0),
-        sizes.iter().sum::<usize>() as f64 / n_clusters as f64
-    );
 
     let index = IvfIndex {
         dim,
@@ -236,7 +223,6 @@ pub fn build_index(
     // Write output parquet with embedded index
     write_parquet_with_index(output_path, &batches, schema, &index, embedding_column)?;
 
-    println!("Index embedded into {:?}", output_path);
     Ok(())
 }
 
@@ -273,8 +259,9 @@ pub fn topk(
         .flat_map(|&c| index.inverted_lists[c].iter().copied())
         .collect();
 
-    // Read embeddings from parquet
-    let embeddings = read_embeddings_for_rows(parquet_path, &embedding_column, &rows_to_check)?;
+    // Read embeddings from parquet (only the rows we need)
+    let embeddings =
+        read_embeddings_for_rows(parquet_path, &embedding_column, &rows_to_check, index.dim)?;
 
     // Use max-heap to track top-k
     let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(k + 1);
@@ -369,13 +356,13 @@ fn write_parquet_with_index(
     let vector_size = index.dim * std::mem::size_of::<f32>();
 
     // Configure writer properties:
-    // - Set data page size to vector size for better random access
-    // - Disable compression on embedding column for direct access
-    // - Enable page index for efficient seeking
+    // - Set data page size to vector size so each embedding is one page
+    // - Use LZ4_RAW compression for embedding column (fast decompression)
+    // - Disable dictionary encoding for embedding column (critical for selective reads!)
     let embedding_col_path = parquet::schema::types::ColumnPath::new(vec![
         embedding_column.to_string(),
         "list".to_string(),
-        "item".to_string(),
+        "element".to_string(),
     ]);
 
     let props = WriterProperties::builder()
@@ -383,8 +370,11 @@ fn write_parquet_with_index(
         .set_data_page_size_limit(vector_size)
         // One row per page for better random access
         .set_data_page_row_count_limit(1)
-        // Disable compression for embedding column to allow direct random access
-        .set_column_compression(embedding_col_path, Compression::UNCOMPRESSED)
+        // LZ4_RAW for fast decompression - one page = one vector
+        .set_column_compression(embedding_col_path.clone(), Compression::LZ4_RAW)
+        // Disable dictionary encoding - critical for selective row reads!
+        // With dictionary encoding, reading any page requires loading the dictionary first
+        .set_column_dictionary_enabled(embedding_col_path, false)
         .build();
 
     let file = File::create(path)?;
@@ -421,11 +411,6 @@ fn write_parquet_with_index(
     ));
 
     writer.close()?;
-
-    println!(
-        "Wrote index at offset {}, size {} bytes (vector_size={})",
-        index_offset, index_len, vector_size
-    );
 
     Ok(())
 }
@@ -474,51 +459,118 @@ fn read_index_from_parquet(path: &Path) -> Result<(IvfIndex, String), Box<dyn st
 
     let index = IvfIndex::from_bytes(&index_bytes)?;
 
-    println!(
-        "Read IVF index: {} clusters, dim={}",
-        index.n_clusters, index.dim
-    );
-
     Ok((index, embedding_column))
 }
 
-/// Read embeddings for specific rows
+/// Read embeddings for specific rows using direct page reads.
+///
+/// This uses the parquet offset index to read only the specific pages we need,
+/// bypassing the normal reader which may read intermediate pages.
 fn read_embeddings_for_rows(
     path: &Path,
     embedding_column: &str,
     rows: &[u32],
+    dim: usize,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    // For simplicity, read all embeddings and filter
-    // A production implementation would use row group/page index for efficiency
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
+    // Use tokio runtime for async file reading with proper page skipping
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
 
-    let mut all_embeddings = Vec::new();
-    let mut dim = 0;
+    rt.block_on(read_embeddings_for_rows_async(
+        path,
+        embedding_column,
+        rows,
+        dim,
+    ))
+}
 
-    for batch in reader {
-        let batch = batch?;
-        let embedding_col = batch.column_by_name(embedding_column).unwrap();
+async fn read_embeddings_for_rows_async(
+    path: &Path,
+    embedding_column: &str,
+    rows: &[u32],
+    dim: usize,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+    use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
+    use parquet::arrow::ProjectionMask;
+
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Sort rows for efficient sequential page access
+    let mut sorted_rows: Vec<u32> = rows.to_vec();
+    sorted_rows.sort_unstable();
+
+    // Open file with async reader
+    let file = tokio::fs::File::open(path).await?;
+
+    // Build the stream with page index enabled for page-level skipping
+    let options = ArrowReaderOptions::new().with_page_index(true);
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(file, options).await?;
+
+    // Create projection mask to only read embedding column
+    let schema = builder.schema();
+    let embedding_col_idx = schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == embedding_column)
+        .ok_or_else(|| format!("Column '{}' not found", embedding_column))?;
+    let projection = ProjectionMask::roots(builder.parquet_schema(), [embedding_col_idx]);
+
+    // Build row selection from sorted rows
+    let total_rows = builder.metadata().file_metadata().num_rows() as usize;
+    let mut selectors = Vec::new();
+    let mut current_pos = 0;
+
+    for &row in &sorted_rows {
+        let row = row as usize;
+        if row > current_pos {
+            selectors.push(RowSelector::skip(row - current_pos));
+        }
+        selectors.push(RowSelector::select(1));
+        current_pos = row + 1;
+    }
+    if current_pos < total_rows {
+        selectors.push(RowSelector::skip(total_rows - current_pos));
+    }
+
+    let selection = RowSelection::from(selectors);
+
+    // Build the stream - async reader will only fetch pages needed for selection
+    let mut stream = builder
+        .with_projection(projection)
+        .with_row_selection(selection)
+        .build()?;
+
+    // Collect embeddings in sorted order
+    use futures::StreamExt;
+    let mut sorted_embeddings = Vec::with_capacity(sorted_rows.len() * dim);
+    while let Some(batch) = stream.next().await {
+        let batch: arrow::record_batch::RecordBatch = batch?;
+        let embedding_col = batch.column(0);
         let list_array = embedding_col.as_any().downcast_ref::<ListArray>().unwrap();
         let values = list_array.values();
         let float_array = values.as_any().downcast_ref::<Float32Array>().unwrap();
 
-        if dim == 0 && list_array.len() > 0 {
-            dim = float_array.len() / list_array.len();
-        }
-
         for i in 0..float_array.len() {
-            all_embeddings.push(float_array.value(i));
+            sorted_embeddings.push(float_array.value(i));
         }
     }
 
-    // Extract only the rows we need
+    // Reorder embeddings to match original row order
+    let row_to_sorted_idx: std::collections::HashMap<u32, usize> = sorted_rows
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| (r, i))
+        .collect();
+
     let mut result = Vec::with_capacity(rows.len() * dim);
-    for &row_idx in rows {
-        let start = row_idx as usize * dim;
-        let end = start + dim;
-        result.extend_from_slice(&all_embeddings[start..end]);
+    for &row in rows {
+        let sorted_idx = row_to_sorted_idx[&row];
+        let start = sorted_idx * dim;
+        result.extend_from_slice(&sorted_embeddings[start..start + dim]);
     }
 
     Ok(result)
@@ -590,7 +642,7 @@ fn kmeans(
     let mut assignments = vec![0usize; n];
     let mut cluster_sizes = vec![0usize; k];
 
-    for iter in 0..max_iters {
+    for _iter in 0..max_iters {
         // Assignment step
         let mut changed = 0;
         cluster_sizes.fill(0);
@@ -615,8 +667,6 @@ fn kmeans(
             assignments[i] = best_cluster;
             cluster_sizes[best_cluster] += 1;
         }
-
-        println!("K-means iter {}: {} assignments changed", iter + 1, changed);
 
         if changed == 0 {
             break;

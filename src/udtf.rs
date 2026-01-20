@@ -258,7 +258,7 @@ impl TableProvider for TopkResultProvider {
 /// Usage in SQL: `topk_bin(path, base64_query_vector, k, nprobe)`
 ///
 /// The query vector should be base64-encoded little-endian f32 bytes.
-/// Use `encode_query_vector()` to create the base64 string from a Vec<f32>.
+/// Use `encode_query_vector()` to create the base64 string from a `Vec<f32>`.
 #[derive(Debug)]
 pub struct TopkBinaryTableFunction;
 

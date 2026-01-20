@@ -2108,6 +2108,7 @@ dependencies = [
  "async-trait",
  "base64",
  "datafusion",
+ "futures",
  "parquet",
  "rand 0.8.5",
  "serde",

@@ -1,3 +1,12 @@
+//! Example demonstrating IVF index correctness by comparing against brute force.
+//!
+//! This example:
+//! 1. Builds an IVF index with 50 clusters
+//! 2. Compares IVF search results against brute-force search
+//! 3. Shows recall@k vs nprobe tradeoff
+//!
+//! Run with: cargo run --example verify_correctness
+
 use arrow::array::{Array, Float32Array, ListArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pq_vector::{build_index, topk, IvfBuildParams};
