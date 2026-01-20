@@ -75,7 +75,7 @@ Let's make this concrete. We have a parquet file with ~5,000 academic papers and
 ```
 data/combined.parquet
 ├── 4,886 rows
-├── 64.65 MB
+├── 68 MB (LZ4 compressed)
 └── Columns: title, authors, abstract, embedding (4096-dim)
 ```
 
@@ -96,26 +96,33 @@ This creates a new parquet file with an embedded IVF index. The overhead?
 
 | File           | Size          |
 | -------------- | ------------- |
-| Original       | 64.65 MB      |
+| Original (LZ4) | 68.00 MB      |
 | With index     | 68.21 MB      |
-| Index overhead | 3.56 MB (5%)  |
+| Index overhead | 0.21 MB (0.3%)|
 
-The index adds just 5% to the file size—the LZ4 compression on embeddings actually saves more space than the index costs.
+The index adds just 0.3% to the file size—the IVF index only stores cluster centroids and row pointers, not the embeddings themselves.
 
 ### Step 2: Search
 
 ```rust
 use pq_vector::topk;
+use std::path::Path;
 
-let results = topk(
-    Path::new("data/combined_indexed.parquet"),
-    &query_vector,  // your 4096-dim query
-    10,             // k results
-    5               // nprobe (clusters to search)
-)?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let results = topk(
+        Path::new("data/combined_indexed.parquet"),
+        &query_vector,  // your 4096-dim query
+        10,             // k results
+        5               // nprobe (clusters to search)
+    )
+    .await?;
 
-for r in results {
-    println!("Row {}: distance {:.4}", r.row_idx, r.distance);
+    for r in results {
+        println!("Row {}: distance {:.4}", r.row_idx, r.distance);
+    }
+
+    Ok(())
 }
 ```
 
@@ -155,19 +162,23 @@ The `topk_bin` table function returns a table with all original columns plus `_d
 
 ## Performance
 
-Real numbers on 4,886 vectors with 4096 dimensions:
+Real numbers on 4,886 vectors with 4096 dimensions (both files use LZ4 compression):
 
-| Operation              | Time   | Speedup    |
-| ---------------------- | ------ | ---------- |
-| Index build            | ~28s   | (one-time) |
-| Brute force search     | ~96ms  | 1x         |
-| IVF search (nprobe=1)  | ~4ms   | **24x**    |
-| IVF search (nprobe=5)  | ~22ms  | **4x**     |
-| IVF search (nprobe=10) | ~39ms  | **2.5x**   |
+| Operation              | Time    | Speedup | Recall@10 |
+| ---------------------- | ------- | ------- | --------- |
+| Index build            | ~28s    | —       | —         |
+| Brute force (with I/O) | 100ms   | 1x      | 1.00      |
+| IVF search (nprobe=1)  | 3.4ms   | **29x** | 0.83      |
+| IVF search (nprobe=2)  | 7.0ms   | **14x** | 0.90      |
+| IVF search (nprobe=5)  | 17.7ms  | **5.7x**| 0.96      |
+| IVF search (nprobe=10) | 32.4ms  | **3.1x**| 1.00      |
 
-The trick? Async I/O with page-level skipping. We configured the file so each embedding lives in its own page with LZ4 compression, then use Parquet's offset index to read and decompress only the pages we need. The async reader fetches just the byte ranges for selected pages—no wasted I/O.
+The speedup comes from reading fewer pages. Brute force must read all 68MB; IVF with nprobe=1 reads only ~1.4% of clusters. The trade-off is recall—at nprobe=1 you find 83% of the true top-10 results.
 
-With nprobe=1 (searching ~1.4% of clusters), we get 24x speedup. The gap grows with dataset size as the fraction of data read shrinks.
+For reference, in-memory brute force (data already loaded) takes only 7.4ms. So if you're doing many queries on cached data, the picture changes. IVF shines for:
+- Cold queries where I/O dominates
+- Datasets too large to cache
+- Acceptable recall loss (nprobe=5 gives 96% recall at 5.7x speedup)
 
 ## The Trade-offs (Honest Assessment)
 

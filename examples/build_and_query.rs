@@ -4,7 +4,8 @@ use pq_vector::{build_index, topk, IvfBuildParams};
 use std::fs::File;
 use std::path::Path;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_path = Path::new("data/vldb_2025.parquet");
     let output_path = Path::new("data/vldb_2025_indexed.parquet");
     let embedding_column = "embedding";
@@ -25,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Search with different nprobe values
     for nprobe in [1, 3, 5, 10] {
-        let results = topk(output_path, &query, 10, nprobe)?;
+        let results = topk(output_path, &query, 10, nprobe).await?;
         println!(
             "nprobe={}: top results: {:?}",
             nprobe,
@@ -39,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Show detailed results
     println!("\n=== Detailed Results (nprobe=5) ===\n");
-    let results = topk(output_path, &query, 5, 5)?;
+    let results = topk(output_path, &query, 5, 5).await?;
     let titles = get_titles(output_path)?;
 
     for (i, result) in results.iter().enumerate() {
@@ -56,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test with a different query
     println!("=== Searching with row 100's embedding ===\n");
     let query2 = get_embedding_at_row(output_path, embedding_column, 100)?;
-    let results = topk(output_path, &query2, 5, 5)?;
+    let results = topk(output_path, &query2, 5, 5).await?;
 
     for (i, result) in results.iter().enumerate() {
         let title = &titles[result.row_idx as usize];

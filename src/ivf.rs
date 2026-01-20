@@ -233,7 +233,7 @@ pub fn build_index(
 /// * `query` - Query vector
 /// * `k` - Number of results to return
 /// * `nprobe` - Number of clusters to search (higher = more accurate but slower)
-pub fn topk(
+pub async fn topk(
     parquet_path: &Path,
     query: &[f32],
     k: usize,
@@ -260,8 +260,13 @@ pub fn topk(
         .collect();
 
     // Read embeddings from parquet (only the rows we need)
-    let embeddings =
-        read_embeddings_for_rows(parquet_path, &embedding_column, &rows_to_check, index.dim)?;
+    let embeddings = read_embeddings_for_rows(
+        parquet_path,
+        &embedding_column,
+        &rows_to_check,
+        index.dim,
+    )
+    .await?;
 
     // Use max-heap to track top-k
     let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(k + 1);
@@ -466,26 +471,7 @@ fn read_index_from_parquet(path: &Path) -> Result<(IvfIndex, String), Box<dyn st
 ///
 /// This uses the parquet offset index to read only the specific pages we need,
 /// bypassing the normal reader which may read intermediate pages.
-fn read_embeddings_for_rows(
-    path: &Path,
-    embedding_column: &str,
-    rows: &[u32],
-    dim: usize,
-) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    // Use tokio runtime for async file reading with proper page skipping
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(read_embeddings_for_rows_async(
-        path,
-        embedding_column,
-        rows,
-        dim,
-    ))
-}
-
-async fn read_embeddings_for_rows_async(
+async fn read_embeddings_for_rows(
     path: &Path,
     embedding_column: &str,
     rows: &[u32],

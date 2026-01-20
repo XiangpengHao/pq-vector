@@ -42,17 +42,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 use pq_vector::topk;
 use std::path::Path;
 
-let query_vector: Vec<f32> = vec![/* your query embedding */];
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let query_vector: Vec<f32> = vec![/* your query embedding */];
 
-let results = topk(
-    Path::new("data/embeddings_indexed.parquet"),
-    &query_vector,
-    10,    // k: number of results
-    5,     // nprobe: clusters to search (higher = more accurate, slower)
-)?;
+    let results = topk(
+        Path::new("data/embeddings_indexed.parquet"),
+        &query_vector,
+        10,    // k: number of results
+        5,     // nprobe: clusters to search (higher = more accurate, slower)
+    )
+    .await?;
 
-for result in results {
-    println!("Row {}: distance {:.4}", result.row_idx, result.distance);
+    for result in results {
+        println!("Row {}: distance {:.4}", result.row_idx, result.distance);
+    }
+
+    Ok(())
 }
 ```
 

@@ -14,7 +14,8 @@ use std::cmp::Ordering;
 use std::fs::File;
 use std::path::Path;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_path = Path::new("data/vldb_2025.parquet");
     let output_path = Path::new("data/vldb_2025_indexed.parquet");
     let embedding_column = "embedding";
@@ -44,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let query = &embeddings[query_row * dim..(query_row + 1) * dim];
 
         // IVF search with full nprobe (should be exact)
-        let ivf_results = topk(output_path, query, k, 50)?; // 50 = n_clusters
+        let ivf_results = topk(output_path, query, k, 50).await?; // 50 = n_clusters
 
         // Brute force search
         let bf_results = brute_force_topk(&embeddings, dim, query, k);
@@ -71,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bf_rows: Vec<u32> = bf_results.iter().map(|(idx, _)| *idx as u32).collect();
 
     for nprobe in [1, 2, 5, 10, 20, 50] {
-        let ivf_results = topk(output_path, query, k, nprobe)?;
+        let ivf_results = topk(output_path, query, k, nprobe).await?;
         let ivf_rows: Vec<u32> = ivf_results.iter().map(|r| r.row_idx).collect();
         let recall = ivf_rows.iter().filter(|r| bf_rows.contains(r)).count() as f64 / k as f64;
         println!("nprobe={:2}: recall@{}={:.2}", nprobe, k, recall);

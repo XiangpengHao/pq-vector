@@ -82,13 +82,7 @@ impl TableFunctionImpl for TopkTableFunction {
             10 // default nprobe
         };
 
-        // Execute the search
-        let results = topk(&path, &query_vector, k, nprobe).map_err(|e| {
-            datafusion::error::DataFusionError::Execution(e.to_string())
-        })?;
-
-        // Read the original data to join with results
-        let provider = TopkResultProvider::new(path, results, query_vector)?;
+        let provider = TopkResultProvider::new(path, query_vector, k, nprobe)?;
 
         Ok(Arc::new(provider))
     }
@@ -146,18 +140,19 @@ fn extract_floats_from_array(array: &ArrayRef) -> Result<Vec<f32>> {
 #[derive(Debug)]
 struct TopkResultProvider {
     schema: SchemaRef,
-    batches: Vec<RecordBatch>,
+    parquet_path: PathBuf,
+    query_vector: Vec<f32>,
+    k: usize,
+    nprobe: usize,
 }
 
 impl TopkResultProvider {
     fn new(
         parquet_path: PathBuf,
-        results: Vec<SearchResult>,
-        _query_vector: Vec<f32>,
+        query_vector: Vec<f32>,
+        k: usize,
+        nprobe: usize,
     ) -> Result<Self> {
-        use arrow::compute::concat_batches;
-
-        // Read original parquet data
         let file = std::fs::File::open(&parquet_path).map_err(|e| {
             datafusion::error::DataFusionError::External(Box::new(e))
         })?;
@@ -165,13 +160,6 @@ impl TopkResultProvider {
         let builder =
             parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
         let parquet_schema = builder.schema().clone();
-        let reader = builder.build()?;
-
-        // Read all batches into memory and concatenate
-        let mut all_batches: Vec<RecordBatch> = Vec::new();
-        for batch in reader {
-            all_batches.push(batch?);
-        }
 
         // Build schema: original columns + _distance + _row_idx
         let mut fields: Vec<Field> = parquet_schema
@@ -183,42 +171,67 @@ impl TopkResultProvider {
         fields.push(Field::new("_row_idx", DataType::UInt32, false));
         let schema = Arc::new(Schema::new(fields));
 
-        // Handle empty results
-        if results.is_empty() {
-            return Ok(Self {
-                schema,
-                batches: vec![],
-            });
-        }
-
-        // Concatenate all batches into one
-        let combined = concat_batches(&parquet_schema, &all_batches)?;
-
-        // Create indices array for take operation (sorted by distance, i.e., result order)
-        let indices: Vec<u32> = results.iter().map(|r| r.row_idx).collect();
-        let indices_array = arrow::array::UInt32Array::from(indices.clone());
-
-        // Use take to extract rows in the desired order
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(combined.num_columns() + 2);
-        for col in combined.columns() {
-            let taken = arrow::compute::take(col, &indices_array, None)?;
-            columns.push(taken);
-        }
-
-        // Add _distance column
-        let distances: Vec<f32> = results.iter().map(|r| r.distance).collect();
-        columns.push(Arc::new(Float32Array::from(distances)));
-
-        // Add _row_idx column
-        columns.push(Arc::new(arrow::array::UInt32Array::from(indices)));
-
-        let result_batch = RecordBatch::try_new(schema.clone(), columns)?;
-
         Ok(Self {
             schema,
-            batches: vec![result_batch],
+            parquet_path,
+            query_vector,
+            k,
+            nprobe,
         })
     }
+}
+
+fn build_result_batches(
+    parquet_path: &PathBuf,
+    results: &[SearchResult],
+    schema: SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    use arrow::compute::concat_batches;
+
+    // Read original parquet data
+    let file = std::fs::File::open(parquet_path).map_err(|e| {
+        datafusion::error::DataFusionError::External(Box::new(e))
+    })?;
+
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let parquet_schema = builder.schema().clone();
+    let reader = builder.build()?;
+
+    // Read all batches into memory and concatenate
+    let mut all_batches: Vec<RecordBatch> = Vec::new();
+    for batch in reader {
+        all_batches.push(batch?);
+    }
+
+    // Handle empty results
+    if results.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Concatenate all batches into one
+    let combined = concat_batches(&parquet_schema, &all_batches)?;
+
+    // Create indices array for take operation (sorted by distance, i.e., result order)
+    let indices: Vec<u32> = results.iter().map(|r| r.row_idx).collect();
+    let indices_array = arrow::array::UInt32Array::from(indices.clone());
+
+    // Use take to extract rows in the desired order
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(combined.num_columns() + 2);
+    for col in combined.columns() {
+        let taken = arrow::compute::take(col, &indices_array, None)?;
+        columns.push(taken);
+    }
+
+    // Add _distance column
+    let distances: Vec<f32> = results.iter().map(|r| r.distance).collect();
+    columns.push(Arc::new(Float32Array::from(distances)));
+
+    // Add _row_idx column
+    columns.push(Arc::new(arrow::array::UInt32Array::from(indices)));
+
+    let result_batch = RecordBatch::try_new(schema, columns)?;
+
+    Ok(vec![result_batch])
 }
 
 #[async_trait]
@@ -242,8 +255,20 @@ impl TableProvider for TopkResultProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let results = topk(&self.parquet_path, &self.query_vector, self.k, self.nprobe)
+            .await
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+        let parquet_path = self.parquet_path.clone();
+        let schema = self.schema.clone();
+        let batches = tokio::task::spawn_blocking(move || {
+            build_result_batches(&parquet_path, &results, schema.clone())
+        })
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))??;
+
         Ok(MemorySourceConfig::try_new_exec(
-            &[self.batches.clone()],
+            &[batches],
             self.schema.clone(),
             projection.cloned(),
         )?)
@@ -303,12 +328,7 @@ impl TableFunctionImpl for TopkBinaryTableFunction {
             10
         };
 
-        // Execute the search
-        let results = topk(&path, &query_vector, k, nprobe).map_err(|e| {
-            datafusion::error::DataFusionError::Execution(e.to_string())
-        })?;
-
-        let provider = TopkResultProvider::new(path, results, query_vector)?;
+        let provider = TopkResultProvider::new(path, query_vector, k, nprobe)?;
         Ok(Arc::new(provider))
     }
 }
