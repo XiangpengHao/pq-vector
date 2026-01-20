@@ -10,14 +10,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_path = Path::new("data/vldb_2025_indexed.parquet");
     let embedding_column = "embedding";
 
-    // Build the index if not already done
-    if !output_path.exists() {
-        let params = IvfBuildParams {
-            max_iters: 10,
-            ..Default::default()
-        };
-        build_index(source_path, output_path, embedding_column, &params)?;
-    }
+    // Build the index with more clusters for a realistic test
+    // With sqrt(496)≈22 clusters, most neighbors end up in the same cluster
+    // Use 50 clusters to show the recall/nprobe tradeoff
+    let params = IvfBuildParams {
+        n_clusters: Some(50),
+        max_iters: 20,
+        ..Default::default()
+    };
+    build_index(source_path, output_path, embedding_column, &params)?;
 
     // Load all embeddings for brute force comparison
     let (embeddings, dim) = read_embeddings(output_path, embedding_column)?;
@@ -34,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let query = &embeddings[query_row * dim..(query_row + 1) * dim];
 
         // IVF search with full nprobe (should be exact)
-        let ivf_results = topk(output_path, query, k, 23)?; // 23 = n_clusters
+        let ivf_results = topk(output_path, query, k, 50)?; // 50 = n_clusters
 
         // Brute force search
         let bf_results = brute_force_topk(&embeddings, dim, query, k);
@@ -60,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bf_results = brute_force_topk(&embeddings, dim, query, k);
     let bf_rows: Vec<u32> = bf_results.iter().map(|(idx, _)| *idx as u32).collect();
 
-    for nprobe in [1, 2, 3, 5, 10, 23] {
+    for nprobe in [1, 2, 5, 10, 20, 50] {
         let ivf_results = topk(output_path, query, k, nprobe)?;
         let ivf_rows: Vec<u32> = ivf_results.iter().map(|r| r.row_idx).collect();
         let recall = ivf_rows.iter().filter(|r| bf_rows.contains(r)).count() as f64 / k as f64;
