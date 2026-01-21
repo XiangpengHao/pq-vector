@@ -54,33 +54,16 @@ impl TableFunctionImpl for TopkTableFunction {
         }
 
         // Argument 1: parquet path (string)
-        let path = match &exprs[0] {
-            Expr::Literal(ScalarValue::Utf8(Some(s)), _) => PathBuf::from(s),
-            _ => return plan_err!("First argument (path) must be a string literal"),
-        };
+        let path = parse_parquet_path(&exprs[0])?;
 
         // Argument 2: query vector (array of floats)
         let query_vector = extract_float_array(&exprs[1])?;
 
         // Argument 3: k (integer)
-        let k = match &exprs[2] {
-            Expr::Literal(ScalarValue::Int64(Some(v)), _) => *v as usize,
-            Expr::Literal(ScalarValue::Int32(Some(v)), _) => *v as usize,
-            Expr::Literal(ScalarValue::UInt64(Some(v)), _) => *v as usize,
-            _ => return plan_err!("Third argument (k) must be an integer literal"),
-        };
+        let k = parse_usize_literal(&exprs[2], "Third argument (k)")?;
 
         // Argument 4: nprobe (optional integer, default 10)
-        let nprobe = if exprs.len() > 3 {
-            match &exprs[3] {
-                Expr::Literal(ScalarValue::Int64(Some(v)), _) => *v as usize,
-                Expr::Literal(ScalarValue::Int32(Some(v)), _) => *v as usize,
-                Expr::Literal(ScalarValue::UInt64(Some(v)), _) => *v as usize,
-                _ => return plan_err!("Fourth argument (nprobe) must be an integer literal"),
-            }
-        } else {
-            10 // default nprobe
-        };
+        let nprobe = parse_nprobe(exprs)?;
 
         let provider = TopkResultProvider::new(path, query_vector, k, nprobe)?;
 
@@ -181,12 +164,40 @@ impl TopkResultProvider {
     }
 }
 
+fn parse_parquet_path(expr: &Expr) -> Result<PathBuf> {
+    match expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(PathBuf::from(s)),
+        _ => plan_err!("First argument (path) must be a string literal"),
+    }
+}
+
+fn parse_usize_literal(expr: &Expr, label: &str) -> Result<usize> {
+    match expr {
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => Ok(*v as usize),
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => Ok(*v as usize),
+        Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok(*v as usize),
+        _ => plan_err!("{} must be an integer literal", label),
+    }
+}
+
+fn parse_nprobe(exprs: &[Expr]) -> Result<usize> {
+    if exprs.len() > 3 {
+        parse_usize_literal(&exprs[3], "Fourth argument (nprobe)")
+    } else {
+        Ok(10)
+    }
+}
+
 fn build_result_batches(
     parquet_path: &PathBuf,
     results: &[SearchResult],
     schema: SchemaRef,
 ) -> Result<Vec<RecordBatch>> {
     use arrow::compute::concat_batches;
+
+    if results.is_empty() {
+        return Ok(vec![]);
+    }
 
     // Read original parquet data
     let file = std::fs::File::open(parquet_path).map_err(|e| {
@@ -201,11 +212,6 @@ fn build_result_batches(
     let mut all_batches: Vec<RecordBatch> = Vec::new();
     for batch in reader {
         all_batches.push(batch?);
-    }
-
-    // Handle empty results
-    if results.is_empty() {
-        return Ok(vec![]);
     }
 
     // Concatenate all batches into one
@@ -262,7 +268,7 @@ impl TableProvider for TopkResultProvider {
         let parquet_path = self.parquet_path.clone();
         let schema = self.schema.clone();
         let batches = tokio::task::spawn_blocking(move || {
-            build_result_batches(&parquet_path, &results, schema.clone())
+            build_result_batches(&parquet_path, &results, schema)
         })
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))??;
@@ -297,10 +303,7 @@ impl TableFunctionImpl for TopkBinaryTableFunction {
         }
 
         // Argument 1: parquet path (string)
-        let path = match &exprs[0] {
-            Expr::Literal(ScalarValue::Utf8(Some(s)), _) => PathBuf::from(s),
-            _ => return plan_err!("First argument (path) must be a string literal"),
-        };
+        let path = parse_parquet_path(&exprs[0])?;
 
         // Argument 2: base64-encoded query vector
         let query_vector = match &exprs[1] {
@@ -309,24 +312,10 @@ impl TableFunctionImpl for TopkBinaryTableFunction {
         };
 
         // Argument 3: k (integer)
-        let k = match &exprs[2] {
-            Expr::Literal(ScalarValue::Int64(Some(v)), _) => *v as usize,
-            Expr::Literal(ScalarValue::Int32(Some(v)), _) => *v as usize,
-            Expr::Literal(ScalarValue::UInt64(Some(v)), _) => *v as usize,
-            _ => return plan_err!("Third argument (k) must be an integer literal"),
-        };
+        let k = parse_usize_literal(&exprs[2], "Third argument (k)")?;
 
         // Argument 4: nprobe (optional integer, default 10)
-        let nprobe = if exprs.len() > 3 {
-            match &exprs[3] {
-                Expr::Literal(ScalarValue::Int64(Some(v)), _) => *v as usize,
-                Expr::Literal(ScalarValue::Int32(Some(v)), _) => *v as usize,
-                Expr::Literal(ScalarValue::UInt64(Some(v)), _) => *v as usize,
-                _ => return plan_err!("Fourth argument (nprobe) must be an integer literal"),
-            }
-        } else {
-            10
-        };
+        let nprobe = parse_nprobe(exprs)?;
 
         let provider = TopkResultProvider::new(path, query_vector, k, nprobe)?;
         Ok(Arc::new(provider))

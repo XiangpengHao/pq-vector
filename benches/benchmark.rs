@@ -1,9 +1,5 @@
 use arrow::array::{Array, Float32Array, ListArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
-use parquet::schema::types::ColumnPath;
 use pq_vector::{build_index, topk, IvfBuildParams};
 use std::cmp::Ordering;
 use std::fs::{self, File};
@@ -12,14 +8,9 @@ use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let raw_path = Path::new("data/combined.parquet");
     let compressed_path = Path::new("data/combined_lz4.parquet");
     let indexed_path = Path::new("data/combined_indexed.parquet");
     let embedding_column = "embedding";
-
-    // Step 1: Create LZ4-compressed version of input file for fair comparison
-    println!("=== Preparing LZ4-compressed baseline ===");
-    compress_parquet_lz4(raw_path, compressed_path, embedding_column)?;
 
     let compressed_size = fs::metadata(compressed_path)?.len();
     println!(
@@ -27,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compressed_size as f64 / 1024.0 / 1024.0
     );
 
-    // Step 2: Build the index
+    // Step 1: Build the index
     println!("\n=== Building IVF Index ===");
     let start = Instant::now();
     let params = IvfBuildParams {
@@ -59,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_rows = vec![42, 100, 500, 1000, 2000, 3000, 4000];
     let k = 10;
 
-    // Step 3: Benchmark brute force - reading ALL embeddings from parquet each time
+    // Step 2: Benchmark brute force - reading ALL embeddings from parquet each time
     // This is the fair comparison: IVF reads some pages, brute force reads all pages
     println!("\n=== Brute Force Performance (reading from parquet) ===");
     let start = Instant::now();
@@ -94,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bf_mem_time * 1000.0
     );
 
-    // Step 4: Benchmark IVF with different nprobe values + measure recall
+    // Step 3: Benchmark IVF with different nprobe values + measure recall
     println!("\n=== IVF Performance & Recall ===");
     println!(
         "{:>8} {:>12} {:>10} {:>10}",
@@ -147,41 +138,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Compress a parquet file with LZ4_RAW on the embedding column
-fn compress_parquet_lz4(
-    input: &Path,
-    output: &Path,
-    embedding_column: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(input)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let schema = builder.schema().clone();
-    let reader = builder.build()?;
-
-    // Collect all batches
-    let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>()?;
-
-    // Configure LZ4_RAW compression for embedding column
-    let embedding_col_path = ColumnPath::new(vec![
-        embedding_column.to_string(),
-        "list".to_string(),
-        "element".to_string(),
-    ]);
-
-    let props = WriterProperties::builder()
-        .set_column_compression(embedding_col_path, Compression::LZ4_RAW)
-        .build();
-
-    let file = File::create(output)?;
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-
-    for batch in batches {
-        writer.write(&batch)?;
-    }
-    writer.close()?;
-
-    Ok(())
-}
 
 fn read_all_embeddings(
     path: &Path,

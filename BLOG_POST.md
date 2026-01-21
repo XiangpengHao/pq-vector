@@ -1,36 +1,32 @@
-# Vector Search with Parquet and DataFusion
+# Native Vector Search in Parquet with DataFusion
 
-You've got embeddings. Millions of them. Now what?
+To search vector embeddings, the standard advice is almost always "spin up a vector database."
 
-The obvious answer is "spin up a vector database." But what if I told you that boring old Parquet files can do vector search too? No new file format. No specialized database. Just Parquet, the format that's been quietly storing your data since 2013 while you chased shinier things.
+Tools like Pinecone, Milvus, or specialized formats like Lance are fantastic pieces of engineering.
+But they come with a hidden cost: complexity. New infrastructure to manage, new file formats to learn, and new data to coordinate.
 
-## The Problem with Vector Databases
+But what if you didn't need any of that? What if you could just keep your data in Parquet, the format you're already using, and still get fast vector search?
 
-Don't get me wrong—vector databases are great. LanceDB, in particular, has done impressive work. But they come with baggage:
+This post explores a little experiment: implementing efficient, native vector search directly inside Parquet files.
 
-1. **New file format** - Lance created a whole new columnar format for vectors
-2. **New query engine** - You need LanceDB to read Lance files
-3. **Ecosystem lock-in** - Your data analytics tools don't speak Lance
+## Wait, isn't Parquet terrible for random access?
 
-What if you already have a parquet-based data lake? What if you're already using DataFusion, DuckDB, or Spark? Do you really want to maintain a separate vector database just for embeddings?
+"But Parquet is a columnar format!" I can hear you screaming. "It's designed for heavy scans, not point lookups!"
 
-## Wait, Can Parquet Even Do This?
+You’re not wrong. The common wisdom is that Parquet is ill-suited for random access because it compresses data into pages.
+To read a single row, you typically have to decompress an entire page, which is wasteful if you only want one item.
 
-"But Parquet wasn't designed for vector search!" I hear you say.
+But let's pause and look at the actual numbers for a second.
 
-True. But Parquet was designed to be _flexible_. Let's think about this:
+A typical vector embedding—say, from OpenAI's `text-embedding-3-small` model—has 1,536 dimensions.
+That's about 6KB of data. Now, guess how big a standard Parquet page is? usually a few KB as well.
 
-**Can Parquet store embeddings?** Obviously yes. Embeddings are just arrays of floats, and Parquet handles arrays just fine.
+Do you see where I'm going with this?
 
-**Can Parquet enable fast random access to individual embeddings?** Here's where it gets interesting.
+If we simply configure the Parquet writer to align the page size with the embedding size, we can effectively force each embedding into its own page.
+With this, "decompressing a page" just means "reading the one vector we want."
 
-The Lance team [argues](https://lancedb.com/blog/the-case-for-random-access-i-o) that Parquet is unsuitable for vector search because it compresses data at the page level. You can't just grab one row—you have to decompress an entire page.
-
-But wait. How big is a page? A few KB. How big is a typical embedding? OpenAI's `text-embedding-3-small` (the [most popular model](https://openrouter.ai/models?fmt=cards&output_modalities=embeddings&order=most-popular)) produces 1,536 dimensions × 4 bytes = **6KB**.
-
-That's... exactly one page.
-
-With the right Parquet configuration, each embedding lives in its own page. Random access: solved. No extra work needed—just smart configuration.
+We don't change the file format; we just tune it.
 
 ```rust
 // Configure parquet to store one embedding per page
@@ -41,45 +37,39 @@ let props = WriterProperties::builder()
     .build();
 ```
 
-## But What About Vector Indexes?
+With this simple configuration change, we've effectively turned Parquet into a random-access friendly format for our vectors.
 
-Storing embeddings efficiently is one thing. Searching them fast is another.
+## Zero-Copy Vector Indexing
 
-The naive approach—compute distance to every vector—is O(n). That's fine for a few thousand vectors, but not for millions.
+Of course, fast random access isn't enough. If you have to scan every single row to calculate distances (O(N)), it doesn't matter how fast you can read an individual page — it’ll still be slow. We need an index.
 
-Real vector databases use indexes like IVF (Inverted File Index), HNSW, or various tree structures. Can we do this with Parquet?
+But here’s the challenge: how do we add an index without breaking compatibility?
+We don't want to create a "custom Parquet" that DuckDB or Spark can't read.
 
-Yes! Here's the trick: **Parquet lets you embed arbitrary data in the file without breaking the format.** Standard parquet readers will ignore it; specialized readers can use it.
-More details read [here](https://datafusion.apache.org/blog/2025/07/14/user-defined-parquet-indexes/).
+The solution turns out to be surprisingly elegant.
+Parquet allows you to embed arbitrary metadata in the file footer (more details [here](https://datafusion.apache.org/blog/2025/07/14/user-defined-parquet-indexes/)).
+Standard readers will happily ignore it, but our specialized reader can look for it.
 
-Our approach:
+We chose the Inverted File (IVF) index for this prototype.
+It works by partitioning the vector space into clusters (centroids).
+When we want to search, we figure out which clusters are close to our query, and then we only look at the vectors in those clusters.
 
-1. Build an IVF index on the embedding column
-2. Serialize the index and append it after the data pages
-3. Store the index offset in parquet's key-value metadata
+The best part? It's **zero-copy**.
 
-Any parquet reader can still read the file normally. Our specialized reader also loads the index for fast search.
+Some vector stores (HNSW-based) force you to duplicate your data into their internal structures.
+Our index is just a lightweight list of pointers (row IDs) and cluster centroids.
+The actual heavy vector data stays right where it is — in the Parquet data pages.
 
-### Even better: zero-copy vector indexes
+In our experiments with ~5,000 academic papers each with 4096-dimensional embeddings (we used `qwen/qwen3-embedding-8b`), the index added a negligible **0.21 MB** to a **68 MB** file.
+That's an overhead of just **0.3%**.
 
-We choose IVF index because it allows a even fancier feature: zero-copy vector indexes.
-The index stores pointer to the actual embeddings in the file, does not have to make a copy of the embeddings.
-This makes the index much smaller and faster to load.
+## How it looks in code
 
-This is not feasible with HNSW because every embedding must be part of the index, therefore the index-to-data ratio is super high.
+We implemented a proof-of-concept using Rust, leveraging the `parquet` and `datafusion` crates.
 
-## Show Me The Code
+### 1. Building the Index
 
-Let's make this concrete. We have a parquet file with ~5,000 academic papers and their 4096-dimensional embeddings (`qwen/qwen3-embedding-8b`):
-
-```
-data/combined.parquet
-├── 4,886 rows
-├── 68 MB (LZ4 compressed)
-└── Columns: title, authors, abstract, embedding (4096-dim)
-```
-
-### Step 1: Build the Index
+The builder reads your existing Parquet file, trains K-means centroids, and writes out a new, indexed Parquet file.
 
 ```rust
 use pq_vector::{build_index, IvfBuildParams};
@@ -92,137 +82,51 @@ build_index(
 )?;
 ```
 
-This creates a new parquet file with an embedded IVF index. The overhead?
+### 2. Searching with SQL (DataFusion)
 
-| File           | Size          |
-| -------------- | ------------- |
-| Original (LZ4) | 68.00 MB      |
-| With index     | 68.21 MB      |
-| Index overhead | 0.21 MB (0.3%)|
-
-The index adds just 0.3% to the file size—the IVF index only stores cluster centroids and row pointers, not the embeddings themselves.
-
-### Step 2: Search
+To make this actually useful, we hooked it into DataFusion via a User-Defined Table Function (UDTF).
+This lets you run vector searches using standard SQL syntax.
 
 ```rust
-use pq_vector::topk;
-use std::path::Path;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let results = topk(
-        Path::new("data/combined_indexed.parquet"),
-        &query_vector,  // your 4096-dim query
-        10,             // k results
-        5               // nprobe (clusters to search)
-    )
-    .await?;
-
-    for r in results {
-        println!("Row {}: distance {:.4}", r.row_idx, r.distance);
-    }
-
-    Ok(())
-}
-```
-
-Output:
-
-```
-Row 42: distance 0.0000    <- exact match (we queried with row 42's embedding)
-Row 143: distance 0.6667
-Row 96: distance 0.6832
-Row 187: distance 0.6839
-Row 3159: distance 0.6936
-```
-
-## DataFusion Integration
-
-The whole point of using Parquet is to stay in the ecosystem. Here's how to use vector search directly in SQL:
-
-```rust
-use datafusion::prelude::*;
-use pq_vector::{TopkBinaryTableFunction, encode_query_vector};
-
 let ctx = SessionContext::new();
-ctx.register_udtf("topk_bin", Arc::new(TopkBinaryTableFunction));
+ctx.register_udtf("topk", Arc::new(TopkBinaryTableFunction));
 
-// Encode the query vector as base64 (DataFusion has a [coercion bug](https://github.com/apache/datafusion/issues/19914))
+// We encode the query as base64 to work around some current
+// type coercion bug in DataFusion: https://github.com/apache/datafusion/issues/19914
 let query_b64 = encode_query_vector(&query_vector);
 
 let df = ctx.sql(&format!(
     "SELECT title, _distance
-     FROM topk_bin('data/combined_indexed.parquet', '{}', 10, 5)
+     FROM topk('data/combined_indexed.parquet', '{}', 10, 5)
      WHERE year >= '2023'",
     query_b64
 )).await?;
 ```
 
-The `topk_bin` table function returns a table with all original columns plus `_distance` and `_row_idx`. You can filter, join, aggregate—whatever SQL can do.
+Notice that we can mix the vector search (`topk_bin`) with normal SQL filters (`WHERE year >= '2023'`).
+This is the power of keeping everything in one engine, you don't need a vector search engine.
 
-## Performance
+## Does it actually work?
 
-Real numbers on 4,886 vectors with 4096 dimensions (both files use LZ4 compression):
+We benchmarked this on our dataset of 4,886 vectors (4096 dimensions).
 
-| Operation              | Time    | Speedup | Recall@10 |
-| ---------------------- | ------- | ------- | --------- |
-| Index build            | ~28s    | —       | —         |
-| Brute force (with I/O) | 100ms   | 1x      | 1.00      |
-| IVF search (nprobe=1)  | 3.4ms   | **29x** | 0.83      |
-| IVF search (nprobe=2)  | 7.0ms   | **14x** | 0.90      |
-| IVF search (nprobe=5)  | 17.7ms  | **5.7x**| 0.96      |
-| IVF search (nprobe=10) | 32.4ms  | **3.1x**| 1.00      |
+| Operation              | Time   | Speedup  | Recall@10 |
+| ---------------------- | ------ | -------- | --------- |
+| Brute force            | 100ms  | 1x       | 1.00      |
+| IVF search (nprobe=1)  | 3.4ms  | **29x**  | 0.83      |
+| IVF search (nprobe=5)  | 17.7ms | **5.7x** | 0.96      |
+| IVF search (nprobe=10) | 32.4ms | **3.1x** | 1.00      |
 
-The speedup comes from reading fewer pages. Brute force must read all 68MB; IVF with nprobe=1 reads only ~1.4% of clusters. The trade-off is recall—at nprobe=1 you find 83% of the true top-10 results.
+The results are pretty clear. Even with a simple IVF index, we see massive speedups compared to a full scan. With `nprobe=5`, we're getting **96% recall** at **5.7x the speed** of a brute force scan.
 
-For reference, in-memory brute force (data already loaded) takes only 7.4ms. So if you're doing many queries on cached data, the picture changes. IVF shines for:
-- Cold queries where I/O dominates
-- Datasets too large to cache
-- Acceptable recall loss (nprobe=5 gives 96% recall at 5.7x speedup)
+The latency is almost entirely dominated by random I/O, which validates our theory: if you tune the page size correctly, Parquet handles random access just fine.
 
-## The Trade-offs (Honest Assessment)
+## Limitations and Looking Ahead
 
-This isn't a silver bullet. Here's what you're giving up:
+Now, I don't want to oversell this. This is a prototype, and we're definitely trading some things for simplicity:
 
-**vs. LanceDB/specialized vector DBs:**
+- **No HNSW**: We used IVF because it's simple and compact. Graph-based indexes like HNSW are probably more accurate, but they have much higher space overhead.
+- **DataFusion-native index**: It would be nice to query like `SELECT * FROM table ORDER BY cosine_similarity(vector_column, vector) LIMIT 10`.
+- **Multi-parquet index**: We often query many parquet files, not just one file. Making our system designed for multi-index would be great.
 
-- No HNSW (our IVF is simpler, less accurate at high recall)
-- No product quantization (higher memory usage)
-- No incremental index updates (rebuild required)
-
-But nothing fundamental, need your help to make it better!
-
-**What you're gaining:**
-
-- Zero new dependencies (it's just Parquet)
-- Full ecosystem compatibility (DuckDB, Spark, Polars all read your files)
-- One less database to operate
-- Your data stays in your data lake
-
-## Future Work
-
-This is a proof-of-concept, not a production system. Things we'd want to add:
-
-1. **IVF-PQ** - Product quantization to reduce memory footprint
-2. **Index caching** - Keep the index in memory across queries
-3. **Cosine similarity** - Currently L2 distance only
-4. **Multi-file support** - Federated index across partitioned datasets
-5. **Better DataFusion integration** - Make DataFusion has first-party index support.
-
-## Try It
-
-```bash
-cargo add pq-vector
-
-# Build an index
-pq-vector index input.parquet output.parquet --column embedding
-
-# Query from DataFusion
-# ... see examples/datafusion_sql.rs
-```
-
-The code is at [github.com/XiangpengHao/pq-vector](https://github.com/XiangpengHao/pq-vector). PRs welcome.
-
----
-
-_The best file format is the one you're already using._
+[github.com/XiangpengHao/pq-vector](https://github.com/XiangpengHao/pq-vector)
