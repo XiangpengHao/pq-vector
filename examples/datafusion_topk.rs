@@ -6,7 +6,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use pq_vector::df_vector::{VectorTopKOptimizerRule, VectorTopKOptions, VectorTopKQueryPlanner};
+use pq_vector::df_vector::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
 use pq_vector::{IvfBuildParams, build_index};
 
 #[tokio::main]
@@ -31,8 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state = SessionStateBuilder::new()
         .with_default_features()
-        .with_query_planner(Arc::new(VectorTopKQueryPlanner::new(options)))
-        .with_optimizer_rule(Arc::new(VectorTopKOptimizerRule::new()))
+        .with_physical_optimizer_rule(Arc::new(VectorTopKPhysicalOptimizerRule::new(options)))
         .build();
     let ctx = SessionContext::new_with_state(state);
 

@@ -9,7 +9,7 @@ use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use tempfile::TempDir;
 
 use crate::ivf::{build_index, IvfBuildParams};
-use super::{VectorTopKOptimizerRule, VectorTopKOptions, VectorTopKQueryPlanner};
+use super::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
 
 #[tokio::test]
 async fn vector_topk_end_to_end() -> datafusion::common::Result<()> {
@@ -62,8 +62,9 @@ async fn vector_topk_end_to_end() -> datafusion::common::Result<()> {
     };
     let state = SessionStateBuilder::new()
         .with_default_features()
-        .with_query_planner(Arc::new(VectorTopKQueryPlanner::new(options)))
-        .with_optimizer_rule(Arc::new(VectorTopKOptimizerRule::new()))
+        .with_physical_optimizer_rule(Arc::new(
+            VectorTopKPhysicalOptimizerRule::new(options),
+        ))
         .build();
     let ctx = SessionContext::new_with_state(state);
 
