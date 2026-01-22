@@ -20,17 +20,31 @@
 
 use std::any::Any;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use arrow::array::{Array, ArrayRef, Float32Array, ListArray, RecordBatch};
+use arrow::array::{Array, ArrayRef, Float32Array, ListArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{plan_err, ScalarValue};
-use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::{exec_err, plan_err, DFSchema, ScalarValue};
+use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
+use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::Result;
-use datafusion::logical_expr::{Expr, TableType};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    Statistics,
+};
+use futures::StreamExt;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
+use parquet::file::metadata::ParquetMetaData;
 
 use crate::ivf::{topk, SearchResult};
 
@@ -116,13 +130,15 @@ fn extract_floats_from_array(array: &ArrayRef) -> Result<Vec<f32>> {
     plan_err!("Query vector values must be float32 or float64")
 }
 
-/// Table provider that holds the results of an IVF search.
+/// Table provider that runs IVF search and returns matching parquet rows.
 ///
-/// This provider joins the search results (row_idx, distance) with the
-/// original parquet data to return complete rows.
+/// This provider builds a row selection from the IVF index and returns a
+/// DataSourceExec that reads only the selected rows from parquet.
 #[derive(Debug)]
 struct TopkResultProvider {
     schema: SchemaRef,
+    file_schema: SchemaRef,
+    metadata: Arc<ParquetMetaData>,
     parquet_path: PathBuf,
     query_vector: Vec<f32>,
     k: usize,
@@ -140,22 +156,23 @@ impl TopkResultProvider {
             datafusion::error::DataFusionError::External(Box::new(e))
         })?;
 
-        let builder =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         let parquet_schema = builder.schema().clone();
+        let metadata = builder.metadata().clone();
 
-        // Build schema: original columns + _distance + _row_idx
+        // Build schema: original columns + _distance
         let mut fields: Vec<Field> = parquet_schema
             .fields()
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        fields.push(Field::new("_distance", DataType::Float32, false));
-        fields.push(Field::new("_row_idx", DataType::UInt32, false));
+        fields.push(Field::new(DISTANCE_COLUMN, DataType::Float32, false));
         let schema = Arc::new(Schema::new(fields));
 
         Ok(Self {
             schema,
+            file_schema: parquet_schema,
+            metadata,
             parquet_path,
             query_vector,
             k,
@@ -188,56 +205,343 @@ fn parse_nprobe(exprs: &[Expr]) -> Result<usize> {
     }
 }
 
-fn build_result_batches(
-    parquet_path: &PathBuf,
+const DISTANCE_COLUMN: &str = "_distance";
+
+fn expr_references_distance(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = expr.apply(|expr| {
+        if let Expr::Column(column) = expr {
+            if column.name == DISTANCE_COLUMN {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+fn build_access_plan(
+    metadata: &ParquetMetaData,
     results: &[SearchResult],
-    schema: SchemaRef,
-) -> Result<Vec<RecordBatch>> {
-    use arrow::compute::concat_batches;
-
+) -> Result<(ParquetAccessPlan, Vec<f32>)> {
+    let num_row_groups = metadata.num_row_groups();
     if results.is_empty() {
-        return Ok(vec![]);
+        return Ok((ParquetAccessPlan::new_none(num_row_groups), Vec::new()));
     }
 
-    // Read original parquet data
-    let file = std::fs::File::open(parquet_path).map_err(|e| {
-        datafusion::error::DataFusionError::External(Box::new(e))
-    })?;
+    let mut sorted = results.to_vec();
+    sorted.sort_by_key(|r| r.row_idx);
+    sorted.dedup_by_key(|r| r.row_idx);
 
-    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let parquet_schema = builder.schema().clone();
-    let reader = builder.build()?;
-
-    // Read all batches into memory and concatenate
-    let mut all_batches: Vec<RecordBatch> = Vec::new();
-    for batch in reader {
-        all_batches.push(batch?);
+    let mut distances = Vec::with_capacity(sorted.len());
+    let mut row_group_starts = Vec::with_capacity(num_row_groups);
+    let mut current_start = 0u64;
+    for i in 0..num_row_groups {
+        row_group_starts.push(current_start);
+        current_start += metadata.row_group(i).num_rows() as u64;
     }
 
-    // Concatenate all batches into one
-    let combined = concat_batches(&parquet_schema, &all_batches)?;
-
-    // Create indices array for take operation (sorted by distance, i.e., result order)
-    let indices: Vec<u32> = results.iter().map(|r| r.row_idx).collect();
-    let indices_array = arrow::array::UInt32Array::from(indices.clone());
-
-    // Use take to extract rows in the desired order
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(combined.num_columns() + 2);
-    for col in combined.columns() {
-        let taken = arrow::compute::take(col, &indices_array, None)?;
-        columns.push(taken);
+    let mut rows_per_group: Vec<Vec<u32>> = vec![Vec::new(); num_row_groups];
+    for result in &sorted {
+        distances.push(result.distance);
+        let row = result.row_idx as u64;
+        let mut group_idx = None;
+        for (idx, start) in row_group_starts.iter().enumerate() {
+            let end = if idx + 1 < num_row_groups {
+                row_group_starts[idx + 1]
+            } else {
+                current_start
+            };
+            if row >= *start && row < end {
+                group_idx = Some(idx);
+                rows_per_group[idx].push((row - *start) as u32);
+                break;
+            }
+        }
+        if group_idx.is_none() {
+            return plan_err!("Row index {} is out of bounds", row);
+        }
     }
 
-    // Add _distance column
-    let distances: Vec<f32> = results.iter().map(|r| r.distance).collect();
-    columns.push(Arc::new(Float32Array::from(distances)));
+    let mut plan = ParquetAccessPlan::new_none(num_row_groups);
+    for (group_idx, mut rows) in rows_per_group.into_iter().enumerate() {
+        if rows.is_empty() {
+            continue;
+        }
+        rows.sort_unstable();
+        rows.dedup();
 
-    // Add _row_idx column
-    columns.push(Arc::new(arrow::array::UInt32Array::from(indices)));
+        let total_rows = metadata.row_group(group_idx).num_rows() as usize;
+        let mut selectors = Vec::new();
+        let mut current_pos = 0usize;
+        for row in rows {
+            let row = row as usize;
+            if row > current_pos {
+                selectors.push(RowSelector::skip(row - current_pos));
+            }
+            selectors.push(RowSelector::select(1));
+            current_pos = row + 1;
+        }
+        if current_pos < total_rows {
+            selectors.push(RowSelector::skip(total_rows - current_pos));
+        }
+        let selection = RowSelection::from(selectors);
+        plan.scan_selection(group_idx, selection);
+    }
 
-    let result_batch = RecordBatch::try_new(schema, columns)?;
+    Ok((plan, distances))
+}
 
-    Ok(vec![result_batch])
+#[derive(Debug, Clone)]
+enum OutputColumn {
+    Input(usize),
+    Distance,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionPlan {
+    file_projection: Option<Vec<usize>>,
+    output_schema: SchemaRef,
+    output_columns: Vec<OutputColumn>,
+    needs_distance: bool,
+}
+
+impl ProjectionPlan {
+    fn try_new(
+        table_schema: SchemaRef,
+        file_schema_len: usize,
+        projection: Option<&Vec<usize>>,
+    ) -> Result<Self> {
+        let (file_projection, output_schema, output_columns, needs_distance) = match projection {
+            None => {
+                let mut output_columns = Vec::with_capacity(file_schema_len + 1);
+                for idx in 0..file_schema_len {
+                    output_columns.push(OutputColumn::Input(idx));
+                }
+                output_columns.push(OutputColumn::Distance);
+                (
+                    None,
+                    table_schema,
+                    output_columns,
+                    true,
+                )
+            }
+            Some(indices) => {
+                let mut file_projection = Vec::new();
+                for idx in indices {
+                    if *idx < file_schema_len {
+                        file_projection.push(*idx);
+                    }
+                }
+                let output_schema = Arc::new(table_schema.project(indices)?);
+                let mut input_positions = vec![None; file_schema_len];
+                for (pos, idx) in file_projection.iter().enumerate() {
+                    input_positions[*idx] = Some(pos);
+                }
+                let mut output_columns = Vec::with_capacity(indices.len());
+                let mut needs_distance = false;
+                for idx in indices {
+                    if *idx < file_schema_len {
+                        let input_pos = input_positions[*idx].ok_or_else(|| {
+                            datafusion::error::DataFusionError::Plan(format!(
+                                "Missing projection for column {}",
+                                idx
+                            ))
+                        })?;
+                        output_columns.push(OutputColumn::Input(input_pos));
+                    } else if *idx == file_schema_len {
+                        output_columns.push(OutputColumn::Distance);
+                        needs_distance = true;
+                    } else {
+                        return plan_err!("Invalid projection index {}", idx);
+                    }
+                }
+                (
+                    Some(file_projection),
+                    output_schema,
+                    output_columns,
+                    needs_distance,
+                )
+            }
+        };
+
+        Ok(Self {
+            file_projection,
+            output_schema,
+            output_columns,
+            needs_distance,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DistanceProjection {
+    output_schema: SchemaRef,
+    output_columns: Vec<OutputColumn>,
+    distances: Arc<Vec<f32>>,
+}
+
+impl DistanceProjection {
+    fn new(plan: ProjectionPlan, distances: Arc<Vec<f32>>) -> Self {
+        Self {
+            output_schema: plan.output_schema,
+            output_columns: plan.output_columns,
+            distances,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AddDistanceExec {
+    input: Arc<dyn ExecutionPlan>,
+    projection: DistanceProjection,
+    cache: PlanProperties,
+}
+
+impl AddDistanceExec {
+    fn try_new(input: Arc<dyn ExecutionPlan>, projection: DistanceProjection) -> Result<Self> {
+        let input_props = input.properties();
+        let partition_count = input_props.partitioning.partition_count();
+        if partition_count != 1 {
+            return plan_err!(
+                "AddDistanceExec requires a single partition, got {}",
+                partition_count
+            );
+        }
+        let cache = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&projection.output_schema)),
+            input_props.partitioning.clone(),
+            input_props.emission_type,
+            input_props.boundedness,
+        );
+        Ok(Self {
+            input,
+            projection,
+            cache,
+        })
+    }
+}
+
+impl DisplayAs for AddDistanceExec {
+    fn fmt_as(
+        &self,
+        t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "AddDistanceExec")
+            }
+            DisplayFormatType::TreeRender => write!(f, ""),
+        }
+    }
+}
+
+impl ExecutionPlan for AddDistanceExec {
+    fn name(&self) -> &str {
+        "AddDistanceExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return plan_err!("AddDistanceExec expects a single child");
+        }
+        Ok(Arc::new(AddDistanceExec::try_new(
+            Arc::clone(&children[0]),
+            self.projection.clone(),
+        )?))
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let input = self.input.execute(partition, context)?;
+        let output_schema = Arc::clone(&self.projection.output_schema);
+        let stream_schema = Arc::clone(&output_schema);
+        let output_columns = self.projection.output_columns.clone();
+        let distances = Arc::clone(&self.projection.distances);
+        let offset = Arc::new(Mutex::new(0usize));
+
+        let stream = input.map(move |batch| {
+            let batch = batch?;
+            let num_rows = batch.num_rows();
+            let distance_array = if output_columns
+                .iter()
+                .any(|col| matches!(col, OutputColumn::Distance))
+            {
+                let mut guard = offset.lock().unwrap();
+                let start = *guard;
+                let end = start + num_rows;
+                if end > distances.len() {
+                    return exec_err!(
+                        "Distance values exhausted: need {}, have {}",
+                        end,
+                        distances.len()
+                    );
+                }
+                *guard = end;
+                Some(Arc::new(Float32Array::from(
+                    distances[start..end].to_vec(),
+                )) as ArrayRef)
+            } else {
+                None
+            };
+
+            let mut columns = Vec::with_capacity(output_columns.len());
+            for col in &output_columns {
+                match col {
+                    OutputColumn::Input(idx) => columns.push(batch.column(*idx).clone()),
+                    OutputColumn::Distance => {
+                        let array = distance_array.clone().ok_or_else(|| {
+                            datafusion::error::DataFusionError::Execution(
+                                "Distance column requested but not available".to_string(),
+                            )
+                        })?;
+                        columns.push(array);
+                    }
+                }
+            }
+            Ok(arrow::record_batch::RecordBatch::try_new(
+                Arc::clone(&stream_schema),
+                columns,
+            )?)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
 }
 
 #[async_trait]
@@ -256,28 +560,77 @@ impl TableProvider for TopkResultProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let results = topk(&self.parquet_path, &self.query_vector, self.k, self.nprobe)
             .await
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 
-        let parquet_path = self.parquet_path.clone();
-        let schema = self.schema.clone();
-        let batches = tokio::task::spawn_blocking(move || {
-            build_result_batches(&parquet_path, &results, schema)
-        })
-        .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))??;
+        let (access_plan, distances) = build_access_plan(&self.metadata, &results)?;
+        let projection_plan = ProjectionPlan::try_new(
+            Arc::clone(&self.schema),
+            self.file_schema.fields().len(),
+            projection,
+        )?;
 
-        Ok(MemorySourceConfig::try_new_exec(
-            &[batches],
-            self.schema.clone(),
-            projection.cloned(),
-        )?)
+        let file_size = std::fs::metadata(&self.parquet_path)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+            .len();
+        let partitioned_file = PartitionedFile::new(
+            self.parquet_path.to_string_lossy().to_string(),
+            file_size,
+        )
+        .with_extensions(Arc::new(access_plan));
+
+        let pushdown_filters: Vec<Expr> = filters
+            .iter()
+            .cloned()
+            .filter(|expr| !expr_references_distance(expr))
+            .collect();
+
+        let predicate = if pushdown_filters.is_empty() {
+            None
+        } else {
+            let df_schema = DFSchema::try_from(Arc::clone(&self.file_schema))?;
+            conjunction(pushdown_filters)
+                .map(|expr| state.create_physical_expr(expr, &df_schema))
+                .transpose()?
+        };
+
+        let mut source =
+            ParquetSource::new(Arc::clone(&self.file_schema)).with_enable_page_index(true);
+        if let Some(predicate) = predicate {
+            source = source.with_predicate(predicate);
+        }
+        let source = Arc::new(source);
+
+        let file_scan_config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            source,
+        )
+        .with_file(partitioned_file)
+        .with_projection_indices(projection_plan.file_projection.clone())?
+        .with_limit(limit)
+        .build();
+
+        let scan = DataSourceExec::from_data_source(file_scan_config);
+        if projection_plan.needs_distance {
+            let projection =
+                DistanceProjection::new(projection_plan, Arc::new(distances));
+            return Ok(Arc::new(AddDistanceExec::try_new(scan, projection)?));
+        }
+
+        Ok(scan)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }
 

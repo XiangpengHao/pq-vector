@@ -45,12 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Query using the binary table function (works with large vectors!)
     println!("\n=== Query with topk_bin (base64 encoded vector) ===\n");
     let sql = format!(
-        "SELECT _row_idx, _distance, title FROM topk_bin('{}', '{}', 10, 5)",
+        "SELECT _distance, title FROM topk_bin('{}', '{}', 10, 5)",
         indexed_path.display(),
         query_b64
     );
     println!(
-        "SQL: SELECT _row_idx, _distance, title FROM topk_bin('...', '<base64>', 10, 5)\n"
+        "SQL: SELECT _distance, title FROM topk_bin('...', '<base64>', 10, 5)\n"
     );
 
     let df = ctx.sql(&sql).await?;
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_b64_0 = encode_query_vector(&query_vector_0);
 
     let sql = format!(
-        "SELECT _row_idx, _distance, title FROM topk_bin('{}', '{}', 5, 5)",
+        "SELECT _distance, title FROM topk_bin('{}', '{}', 5, 5)",
         indexed_path.display(),
         query_b64_0
     );

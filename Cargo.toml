@@ -31,3 +31,4 @@ datafusion-optimizer = { git = "https://github.com/apache/datafusion.git" }
 datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git" }
 datafusion-physical-plan = { git = "https://github.com/apache/datafusion.git" }
 datafusion-sql = { git = "https://github.com/apache/datafusion.git" }
+datafusion-datasource-parquet = { git = "https://github.com/apache/datafusion.git" }

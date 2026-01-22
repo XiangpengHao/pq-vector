@@ -132,7 +132,6 @@ The table functions return all original columns plus:
 | Column | Type | Description |
 |--------|------|-------------|
 | `_distance` | Float32 | L2 distance from query vector |
-| `_row_idx` | UInt32 | Original row index in Parquet file |
 
 ## How It Works
 
