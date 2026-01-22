@@ -6,27 +6,21 @@
 //! ## Features
 //!
 //! - **IVF Index**: Build and embed IVF indexes directly into Parquet files
-//! - **DataFusion Integration**: Use `topk()` table function in SQL queries
 //!
 //! ## Example
 //!
 //! ```ignore
-//! use datafusion::prelude::*;
-//! use pq_vector::{TopkTableFunction, build_index, IvfBuildParams};
-//! use std::sync::Arc;
+//! use pq_vector::{build_index, topk, IvfBuildParams};
+//! use std::path::Path;
 //!
 //! // Build index
 //! build_index(source, output, "embedding", &IvfBuildParams::default())?;
 //!
-//! // Query with DataFusion
-//! let ctx = SessionContext::new();
-//! ctx.register_udtf("topk", Arc::new(TopkTableFunction));
-//!
-//! let df = ctx.sql("SELECT * FROM topk('file.parquet', ARRAY[1.0, 2.0], 10, 5)").await?;
+//! // Query with Rust API
+//! let query_vector = vec![1.0f32, 2.0f32];
+//! let results = topk(Path::new("file.parquet"), &query_vector, 10, 5).await?;
 //! ```
 
 pub mod ivf;
-pub mod udtf;
 
 pub use ivf::{build_index, topk, IvfBuildParams, SearchResult};
-pub use udtf::TopkTableFunction;

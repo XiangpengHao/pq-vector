@@ -33,30 +33,4 @@ We follow the standard practice to choose k = sqrt(n).
 
 ## Ecosystem integration
 
-The vector index will be inserted as a custom index in the Parquet file, more can be found here: https://datafusion.apache.org/blog/2025/07/14/user-defined-parquet-indexes/
-
-But if we change the column data, how can users still read their vector data?
-
-- So we don't. We use ivf, which is just pointers pointing to the actual data.
-
-### How to leverage the index?
-
-We should create a user-defined-table-function in DataFusion.
-
-```sql
-SELECT *
-FROM topk('/path/to/file.parquet', 'col_embedding', :query_vector, 100)
-WHERE category = 'systems' LIMIT 32;
-```
-
-But it seems that DataFusion doesn't support arbitrary table functions yet.
-https://github.com/apache/datafusion/issues/7926
-https://github.com/apache/datafusion/issues/8383
-
-Need to double check.
-
-### Testing
-
-1. First we will rewrite a parquet file. One example parquet file is in data/vldb_2025.parquet.
-2. Then we will use the aforementioned topk style to query the file.
-3. Finally we show that it works.
+We keep the vector index embedded in the Parquet file without altering the column data, so existing readers can still read the original vectors.

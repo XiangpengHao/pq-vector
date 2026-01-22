@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 arrow = "57.2.0"
 async-trait = "0.1"
-datafusion = "52.0.0"
 futures = "0.3"
 parquet = { version = "57.2.0", features = ["async"] }
 rand = "0.8"
@@ -18,16 +17,3 @@ tokio = { version = "1", features = ["rt-multi-thread", "fs"] }
 name = "benchmark"
 path = "benches/benchmark.rs"
 harness = false
-
-[patch.crates-io]
-datafusion = { git = "https://github.com/apache/datafusion.git" }
-datafusion-catalog = { git = "https://github.com/apache/datafusion.git" }
-datafusion-common = { git = "https://github.com/apache/datafusion.git" }
-datafusion-expr = { git = "https://github.com/apache/datafusion.git" }
-datafusion-functions = { git = "https://github.com/apache/datafusion.git" }
-datafusion-functions-nested = { git = "https://github.com/apache/datafusion.git" }
-datafusion-optimizer = { git = "https://github.com/apache/datafusion.git" }
-datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git" }
-datafusion-physical-plan = { git = "https://github.com/apache/datafusion.git" }
-datafusion-sql = { git = "https://github.com/apache/datafusion.git" }
-datafusion-datasource-parquet = { git = "https://github.com/apache/datafusion.git" }

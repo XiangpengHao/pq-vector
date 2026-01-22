@@ -6,7 +6,6 @@ Embed IVF (Inverted File) vector indexes directly into Parquet files for fast ap
 
 - **Embedded Index**: Index stored within the Parquet file itself - no separate index files
 - **Standard Compatible**: Indexed files remain valid Parquet - DuckDB, Pandas, etc. can read them normally
-- **DataFusion Integration**: SQL table function for vector search queries
 
 ## Quick Start
 
@@ -62,67 +61,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### 3. DataFusion SQL Integration
-
-```rust
-use datafusion::prelude::*;
-use pq_vector::TopkTableFunction;
-use std::sync::Arc;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = SessionContext::new();
-    
-    // Register the topk table function
-    ctx.register_udtf("topk", Arc::new(TopkTableFunction));
-
-    // Query vector for SQL array literal
-    let query_vector: Vec<f32> = vec![/* your query embedding */];
-    let query_array = query_vector
-        .iter()
-        .map(|v| format!("{:.6}", v))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // Query with SQL
-    let df = ctx.sql(&format!(
-        "SELECT title, _distance 
-         FROM topk('data/embeddings_indexed.parquet', ARRAY[{}], 10, 5)
-         LIMIT 5",
-        query_array
-    )).await?;
-
-    df.show().await?;
-    Ok(())
-}
-```
-
-**Output:**
-```
-+--------------------------------------------------+------------+
-| title                                            | _distance  |
-+--------------------------------------------------+------------+
-| Most similar document                            | 0.0        |
-| Second most similar                              | 0.42156    |
-| Third most similar                               | 0.51823    |
-+--------------------------------------------------+------------+
-```
-
-## Table Functions
-
-### `topk`
-
-```sql
-SELECT * FROM topk(path, ARRAY[1.0, 2.0, ...], k, nprobe)
-```
-
 ## Result Columns
 
-The table functions return all original columns plus:
+The Rust API returns row indices and distances:
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `_distance` | Float32 | L2 distance from query vector |
+| `row_idx` | usize | Row index in the Parquet file |
+| `distance` | f32 | L2 distance from query vector |
 
 ## How It Works
 
@@ -163,7 +109,6 @@ With 50 clusters on 496 vectors:
 ```toml
 [dependencies]
 pq-vector = "0.1"
-datafusion = "52.0"  # For SQL integration
 tokio = { version = "1", features = ["rt-multi-thread"] }
 ```
 
