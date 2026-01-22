@@ -59,7 +59,7 @@ pub struct SearchResult {
 }
 
 /// IVF index structure (in-memory representation)
-struct IvfIndex {
+pub(crate) struct IvfIndex {
     dim: usize,
     n_clusters: usize,
     centroids: Vec<f32>,
@@ -163,6 +163,18 @@ impl IvfIndex {
     }
 
     /// Find the closest nprobe centroids to the query
+    pub(crate) fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub(crate) fn candidate_rows(&self, query: &[f32], nprobe: usize) -> Vec<u32> {
+        let closest_clusters = self.find_closest_centroids(query, nprobe);
+        closest_clusters
+            .iter()
+            .flat_map(|&c| self.inverted_lists[c].iter().copied())
+            .collect()
+    }
+
     fn find_closest_centroids(&self, query: &[f32], nprobe: usize) -> Vec<usize> {
         let nprobe = nprobe.min(self.n_clusters);
 
@@ -421,7 +433,9 @@ fn write_parquet_with_index(
 }
 
 /// Read IVF index from parquet file
-fn read_index_from_parquet(path: &Path) -> Result<(IvfIndex, String), Box<dyn std::error::Error>> {
+pub(crate) fn read_index_from_parquet(
+    path: &Path,
+) -> Result<(IvfIndex, String), Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let reader = SerializedFileReader::new(file.try_clone()?)?;
     let metadata = reader.metadata().file_metadata();

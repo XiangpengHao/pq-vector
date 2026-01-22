@@ -21,6 +21,7 @@
 //! let results = topk(Path::new("file.parquet"), &query_vector, 10, 5).await?;
 //! ```
 
+pub mod df_vector;
 pub mod ivf;
 
-pub use ivf::{build_index, topk, IvfBuildParams, SearchResult};
+pub use ivf::{IvfBuildParams, SearchResult, build_index, topk};
