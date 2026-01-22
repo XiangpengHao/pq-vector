@@ -66,26 +66,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use datafusion::prelude::*;
-use pq_vector::{encode_query_vector, TopkBinaryTableFunction};
+use pq_vector::TopkTableFunction;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
     
-    // Register the topk_bin table function
-    ctx.register_udtf("topk_bin", Arc::new(TopkBinaryTableFunction));
+    // Register the topk table function
+    ctx.register_udtf("topk", Arc::new(TopkTableFunction));
 
-    // Encode your query vector as base64
+    // Query vector for SQL array literal
     let query_vector: Vec<f32> = vec![/* your query embedding */];
-    let query_b64 = encode_query_vector(&query_vector);
+    let query_array = query_vector
+        .iter()
+        .map(|v| format!("{:.6}", v))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     // Query with SQL
     let df = ctx.sql(&format!(
         "SELECT title, _distance 
-         FROM topk_bin('data/embeddings_indexed.parquet', '{}', 10, 5)
+         FROM topk('data/embeddings_indexed.parquet', ARRAY[{}], 10, 5)
          LIMIT 5",
-        query_b64
+        query_array
     )).await?;
 
     df.show().await?;
@@ -106,24 +110,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Table Functions
 
-### `topk_bin` (recommended for high-dimensional vectors)
-
-```sql
-SELECT * FROM topk_bin(path, base64_query, k, nprobe)
-```
-
-- `path`: Path to indexed Parquet file
-- `base64_query`: Query vector encoded with `encode_query_vector()`
-- `k`: Number of results to return
-- `nprobe`: Number of clusters to search (default: 10)
-
-### `topk` (for small vectors)
+### `topk`
 
 ```sql
 SELECT * FROM topk(path, ARRAY[1.0, 2.0, ...], k, nprobe)
 ```
-
-Note: Use `topk_bin` for vectors with many dimensions (>100) due to SQL parsing limitations.
 
 ## Result Columns
 

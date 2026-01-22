@@ -2106,7 +2106,6 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
- "base64",
  "datafusion",
  "futures",
  "parquet",

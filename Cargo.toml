@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 arrow = "57.2.0"
 async-trait = "0.1"
-base64 = "0.22"
 datafusion = "52.0.0"
 futures = "0.3"
 parquet = { version = "57.2.0", features = ["async"] }

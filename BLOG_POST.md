@@ -89,21 +89,23 @@ This lets you run vector searches using standard SQL syntax.
 
 ```rust
 let ctx = SessionContext::new();
-ctx.register_udtf("topk", Arc::new(TopkBinaryTableFunction));
+ctx.register_udtf("topk", Arc::new(TopkTableFunction));
 
-// We encode the query as base64 to work around some current
-// type coercion bug in DataFusion: https://github.com/apache/datafusion/issues/19914
-let query_b64 = encode_query_vector(&query_vector);
+let query_array = query_vector
+    .iter()
+    .map(|v| format!("{:.6}", v))
+    .collect::<Vec<_>>()
+    .join(", ");
 
 let df = ctx.sql(&format!(
     "SELECT title, _distance
-     FROM topk('data/combined_indexed.parquet', '{}', 10, 5)
+     FROM topk('data/combined_indexed.parquet', ARRAY[{}], 10, 5)
      WHERE year >= '2023'",
-    query_b64
+    query_array
 )).await?;
 ```
 
-Notice that we can mix the vector search (`topk_bin`) with normal SQL filters (`WHERE year >= '2023'`).
+Notice that we can mix the vector search (`topk`) with normal SQL filters (`WHERE year >= '2023'`).
 This is the power of keeping everything in one engine, you don't need a vector search engine.
 
 ## Does it actually work?

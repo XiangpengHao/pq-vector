@@ -29,4 +29,4 @@ pub mod ivf;
 pub mod udtf;
 
 pub use ivf::{build_index, topk, IvfBuildParams, SearchResult};
-pub use udtf::{encode_query_vector, TopkBinaryTableFunction, TopkTableFunction};
+pub use udtf::TopkTableFunction;

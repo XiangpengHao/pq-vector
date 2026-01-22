@@ -5,7 +5,7 @@
 use arrow::array::{Array, Float32Array, ListArray};
 use datafusion::prelude::*;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pq_vector::{encode_query_vector, TopkBinaryTableFunction, TopkTableFunction};
+use pq_vector::TopkTableFunction;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,37 +21,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let indexed_path = indexed_path.canonicalize()?;
+
     // Get a query vector from the file
-    let query_vector = get_embedding_at_row(indexed_path, "embedding", 42)?;
+    let query_vector = get_embedding_at_row(indexed_path.as_path(), "embedding", 42)?;
     println!(
         "Using embedding from row 42 as query vector (dim={})",
         query_vector.len()
     );
 
-    // Create DataFusion context and register the topk functions
+    // Create DataFusion context and register the topk function
     let ctx = SessionContext::new();
     ctx.register_udtf("topk", Arc::new(TopkTableFunction));
-    ctx.register_udtf("topk_bin", Arc::new(TopkBinaryTableFunction));
 
-    // Encode the query vector as base64 for the binary UDTF
-    let query_b64 = encode_query_vector(&query_vector);
+    let query_array = format_query_array_literal(&query_vector);
     println!(
-        "Base64 encoded query vector: {}...{} ({} bytes)",
-        &query_b64[..20],
-        &query_b64[query_b64.len() - 20..],
-        query_b64.len()
+        "Query vector preview: [{} ... {}] (dim={})",
+        query_vector.first().unwrap_or(&0.0),
+        query_vector.last().unwrap_or(&0.0),
+        query_vector.len()
     );
 
-    // Query using the binary table function (works with large vectors!)
-    println!("\n=== Query with topk_bin (base64 encoded vector) ===\n");
+    // Query using the array literal
+    println!("\n=== Query with topk (array literal vector) ===\n");
     let sql = format!(
-        "SELECT _distance, title FROM topk_bin('{}', '{}', 10, 5)",
+        "SELECT _distance, title FROM topk('{}', ARRAY[{}], 10, 5)",
         indexed_path.display(),
-        query_b64
+        query_array
     );
-    println!(
-        "SQL: SELECT _distance, title FROM topk_bin('...', '<base64>', 10, 5)\n"
-    );
+    println!("SQL: SELECT _distance, title FROM topk('...', ARRAY[...], 10, 5)\n");
 
     let df = ctx.sql(&sql).await?;
     df.show().await?;
@@ -59,9 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Query with LIMIT
     println!("\n=== Query with LIMIT ===\n");
     let sql = format!(
-        "SELECT title, _distance FROM topk_bin('{}', '{}', 20, 10) LIMIT 5",
+        "SELECT title, _distance FROM topk('{}', ARRAY[{}], 20, 10) LIMIT 5",
         indexed_path.display(),
-        query_b64
+        query_array
     );
 
     let df = ctx.sql(&sql).await?;
@@ -69,23 +67,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate using a different query vector (row 0)
     println!("\n=== Search with row 0's embedding ===\n");
-    let query_vector_0 = get_embedding_at_row(indexed_path, "embedding", 0)?;
-    let query_b64_0 = encode_query_vector(&query_vector_0);
+    let query_vector_0 = get_embedding_at_row(indexed_path.as_path(), "embedding", 0)?;
+    let query_array_0 = format_query_array_literal(&query_vector_0);
 
     let sql = format!(
-        "SELECT _distance, title FROM topk_bin('{}', '{}', 5, 5)",
+        "SELECT _distance, title FROM topk('{}', ARRAY[{}], 5, 5)",
         indexed_path.display(),
-        query_b64_0
+        query_array_0
     );
 
     let df = ctx.sql(&sql).await?;
     df.show().await?;
 
-    // For small vectors, regular topk() with ARRAY syntax also works
-    println!("\n=== Small vector with regular topk() ===\n");
-    println!("For small dimension vectors, you can use ARRAY[] syntax:");
-    println!("  SELECT * FROM topk('file.parquet', ARRAY[1.0, 2.0, 3.0], 10, 5)");
-    println!("\nFor large vectors (like 4096-dim), use topk_bin() with base64 encoding.");
+    println!("\n=== Example SQL ===\n");
+    println!("SELECT * FROM topk('file.parquet', ARRAY[1.0, 2.0, 3.0], 10, 5);");
 
     println!("\nAll queries completed successfully!");
     Ok(())
@@ -117,4 +112,15 @@ fn get_embedding_at_row(
         current_row += list_array.len();
     }
     Err("Row not found".into())
+}
+
+fn format_query_array_literal(query_vector: &[f32]) -> String {
+    let mut out = String::new();
+    for (idx, value) in query_vector.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("{:.6}", value));
+    }
+    out
 }

@@ -7,23 +7,21 @@
 //! SELECT * FROM topk('/path/to/file.parquet', ARRAY[1.0, 2.0, ...], 10, 5)
 //! ```
 //!
-//! ## `topk_bin` - Binary (base64) query vector for large dimensions
-//! ```sql
-//! SELECT * FROM topk_bin('/path/to/file.parquet', 'base64_encoded_floats', 10, 5)
-//! ```
-//!
 //! Arguments:
 //! - parquet_path: Path to parquet file with embedded IVF index
-//! - query_vector: Query vector (array literal or base64-encoded f32 bytes)
+//! - query_vector: Query vector (array literal)
 //! - k: Number of results to return
 //! - nprobe: Number of clusters to search (optional, default 10)
 
 use std::any::Any;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use arrow::array::{Array, ArrayRef, Float32Array, ListArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -39,10 +37,10 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-    Statistics,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    SendableRecordBatchStream, Statistics,
 };
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
 use parquet::file::metadata::ParquetMetaData;
 
@@ -52,8 +50,6 @@ use crate::ivf::{topk, SearchResult};
 ///
 /// Usage in SQL: `topk(path, query_vector, k, nprobe)`
 ///
-/// For large dimension vectors (e.g., 4096), use `TopkBinaryTableFunction` instead
-/// to avoid SQL parsing limitations with large array literals.
 #[derive(Debug)]
 pub struct TopkTableFunction;
 
@@ -399,15 +395,179 @@ struct AddDistanceExec {
     cache: PlanProperties,
 }
 
+#[derive(Debug)]
+struct ConcatPartitionsExec {
+    input: Arc<dyn ExecutionPlan>,
+    cache: PlanProperties,
+}
+
+impl ConcatPartitionsExec {
+    fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        let input_props = input.properties();
+        let mut eq_properties = input_props.equivalence_properties().clone();
+        eq_properties.clear_orderings();
+        eq_properties.clear_per_partition_constants();
+        let cache = PlanProperties::new(
+            eq_properties,
+            Partitioning::UnknownPartitioning(1),
+            input_props.emission_type,
+            input_props.boundedness,
+        );
+        Self { input, cache }
+    }
+}
+
+impl DisplayAs for ConcatPartitionsExec {
+    fn fmt_as(
+        &self,
+        t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "ConcatPartitionsExec")
+            }
+            DisplayFormatType::TreeRender => write!(f, ""),
+        }
+    }
+}
+
+impl ExecutionPlan for ConcatPartitionsExec {
+    fn name(&self) -> &str {
+        "ConcatPartitionsExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return plan_err!("ConcatPartitionsExec expects a single child");
+        }
+        Ok(Arc::new(Self::new(Arc::clone(&children[0]))))
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return exec_err!("ConcatPartitionsExec expects a single output partition");
+        }
+        let total_partitions = self.input.properties().partitioning.partition_count();
+        if total_partitions == 0 {
+            return exec_err!(
+                "ConcatPartitionsExec requires at least one input partition"
+            );
+        }
+        let stream = ConcatPartitionsStream::new(
+            Arc::clone(&self.input),
+            Arc::clone(&context),
+            total_partitions,
+        );
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream,
+        )))
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+}
+
+struct ConcatPartitionsStream {
+    input: Arc<dyn ExecutionPlan>,
+    context: Arc<datafusion::execution::TaskContext>,
+    total_partitions: usize,
+    current_partition: usize,
+    current_stream: Option<SendableRecordBatchStream>,
+}
+
+impl ConcatPartitionsStream {
+    fn new(
+        input: Arc<dyn ExecutionPlan>,
+        context: Arc<datafusion::execution::TaskContext>,
+        total_partitions: usize,
+    ) -> Self {
+        Self {
+            input,
+            context,
+            total_partitions,
+            current_partition: 0,
+            current_stream: None,
+        }
+    }
+}
+
+impl Stream for ConcatPartitionsStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if this.current_stream.is_none() {
+                if this.current_partition >= this.total_partitions {
+                    return Poll::Ready(None);
+                }
+                match this.input.execute(
+                    this.current_partition,
+                    Arc::clone(&this.context),
+                ) {
+                    Ok(stream) => {
+                        this.current_stream = Some(stream);
+                    }
+                    Err(err) => return Poll::Ready(Some(Err(err))),
+                }
+            }
+
+            if let Some(stream) = &mut this.current_stream {
+                match Pin::new(stream).poll_next(cx) {
+                    Poll::Ready(Some(batch)) => return Poll::Ready(Some(batch)),
+                    Poll::Ready(None) => {
+                        this.current_stream = None;
+                        this.current_partition += 1;
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
 impl AddDistanceExec {
     fn try_new(input: Arc<dyn ExecutionPlan>, projection: DistanceProjection) -> Result<Self> {
-        let input_props = input.properties();
+        let mut input = input;
+        let mut input_props = input.properties().clone();
         let partition_count = input_props.partitioning.partition_count();
         if partition_count != 1 {
-            return plan_err!(
-                "AddDistanceExec requires a single partition, got {}",
-                partition_count
-            );
+            input = Arc::new(ConcatPartitionsExec::new(Arc::clone(&input)));
+            input_props = input.properties().clone();
         }
         let cache = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projection.output_schema)),
@@ -618,6 +778,12 @@ impl TableProvider for TopkResultProvider {
 
         let scan = DataSourceExec::from_data_source(file_scan_config);
         if projection_plan.needs_distance {
+            let scan: Arc<dyn ExecutionPlan> =
+                if scan.properties().partitioning.partition_count() == 1 {
+                    scan
+                } else {
+                    Arc::new(ConcatPartitionsExec::new(scan))
+                };
             let projection =
                 DistanceProjection::new(projection_plan, Arc::new(distances));
             return Ok(Arc::new(AddDistanceExec::try_new(scan, projection)?));
@@ -632,84 +798,4 @@ impl TableProvider for TopkResultProvider {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
-}
-
-/// Table function that performs IVF vector search using base64-encoded query vector.
-///
-/// This is useful for large dimension vectors (e.g., 4096) where SQL array literals
-/// hit parsing limitations.
-///
-/// Usage in SQL: `topk_bin(path, base64_query_vector, k, nprobe)`
-///
-/// The query vector should be base64-encoded little-endian f32 bytes.
-/// Use `encode_query_vector()` to create the base64 string from a `Vec<f32>`.
-#[derive(Debug)]
-pub struct TopkBinaryTableFunction;
-
-impl TableFunctionImpl for TopkBinaryTableFunction {
-    fn call(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        if exprs.len() < 3 {
-            return plan_err!(
-                "topk_bin requires at least 3 arguments: path, base64_query_vector, k. Got {}",
-                exprs.len()
-            );
-        }
-
-        // Argument 1: parquet path (string)
-        let path = parse_parquet_path(&exprs[0])?;
-
-        // Argument 2: base64-encoded query vector
-        let query_vector = match &exprs[1] {
-            Expr::Literal(ScalarValue::Utf8(Some(s)), _) => decode_query_vector(s)?,
-            _ => return plan_err!("Second argument (query_vector) must be a base64-encoded string"),
-        };
-
-        // Argument 3: k (integer)
-        let k = parse_usize_literal(&exprs[2], "Third argument (k)")?;
-
-        // Argument 4: nprobe (optional integer, default 10)
-        let nprobe = parse_nprobe(exprs)?;
-
-        let provider = TopkResultProvider::new(path, query_vector, k, nprobe)?;
-        Ok(Arc::new(provider))
-    }
-}
-
-/// Encode a query vector as a base64 string for use with `topk_bin`.
-///
-/// # Example
-/// ```
-/// use pq_vector::encode_query_vector;
-///
-/// let query = vec![1.0f32, 2.0, 3.0];
-/// let encoded = encode_query_vector(&query);
-/// // Use `encoded` in SQL: SELECT * FROM topk_bin('file.parquet', '{encoded}', 10, 5)
-/// ```
-pub fn encode_query_vector(query: &[f32]) -> String {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    let bytes: Vec<u8> = query.iter().flat_map(|f| f.to_le_bytes()).collect();
-    STANDARD.encode(&bytes)
-}
-
-/// Decode a base64-encoded query vector.
-fn decode_query_vector(encoded: &str) -> Result<Vec<f32>> {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-
-    let bytes = STANDARD.decode(encoded).map_err(|e| {
-        datafusion::error::DataFusionError::Plan(format!("Invalid base64 encoding: {}", e))
-    })?;
-
-    if bytes.len() % 4 != 0 {
-        return plan_err!(
-            "Invalid query vector: byte length {} is not a multiple of 4",
-            bytes.len()
-        );
-    }
-
-    let floats: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect();
-
-    Ok(floats)
 }
