@@ -10,6 +10,10 @@ use arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Arr
 use arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result, ScalarValue, assert_eq_or_internal_err};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricType,
+    MetricsSet, RecordOutput,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
@@ -30,40 +34,50 @@ use super::options::VectorTopKOptions;
 /// Execution plan for VectorTopK.
 #[derive(Clone)]
 pub(crate) struct VectorTopKExec {
-    input: Arc<dyn ExecutionPlan>,
+    scan_plan: Arc<dyn ExecutionPlan>,
     vector_column: String,
     query: Vec<f32>,
     k: usize,
     options: VectorTopKOptions,
     cache: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
+    metric_handles: VectorTopKMetricHandles,
 }
 
 impl VectorTopKExec {
     pub(crate) fn new(
-        input: Arc<dyn ExecutionPlan>,
+        scan_plan: Arc<dyn ExecutionPlan>,
         vector_column: String,
         query: Vec<f32>,
         k: usize,
         options: VectorTopKOptions,
     ) -> Self {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let metric_handles = VectorTopKMetricHandles::new(&metrics, 0);
         let cache = PlanProperties::new(
-            EquivalenceProperties::new(input.schema()),
+            EquivalenceProperties::new(scan_plan.schema()),
             Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         );
         Self {
-            input,
+            scan_plan,
             vector_column,
             query,
             k,
             options,
             cache,
+            metrics,
+            metric_handles,
         }
     }
 
-    async fn execute_topk(&self, context: Arc<TaskContext>) -> Result<RecordBatch> {
-        let schema = self.input.schema();
+    async fn execute_topk(
+        &self,
+        context: Arc<TaskContext>,
+        metrics: &VectorTopKMetricHandles,
+    ) -> Result<RecordBatch> {
+        let schema = self.scan_plan.schema();
         let vector_idx = schema
             .index_of(&self.vector_column)
             .map_err(|_| {
@@ -73,21 +87,33 @@ impl VectorTopKExec {
                 ))
             })?;
 
-        let scan_info = match gather_single_parquet_scan(&self.input) {
+        let scan_info = match gather_single_parquet_scan(&self.scan_plan) {
             Ok(info) => info,
             Err(_) => None,
         };
 
         if let Some(scan_info) = scan_info {
             if let Some(result) =
-                self.try_execute_with_index(&scan_info, vector_idx, context.clone()).await?
+                self.try_execute_with_index(
+                    &scan_info,
+                    vector_idx,
+                    context.clone(),
+                    metrics,
+                )
+                .await?
             {
                 return Ok(result);
             }
         }
 
-        let batches = collect(self.input.clone(), context).await?;
-        let topk = compute_topk_from_batches(&batches, vector_idx, &self.query, self.k)?;
+        let batches = collect(self.scan_plan.clone(), context).await?;
+        let topk = compute_topk_from_batches(
+            &batches,
+            vector_idx,
+            &self.query,
+            self.k,
+            metrics,
+        )?;
         build_batch_from_rows(schema, topk)
     }
 
@@ -96,8 +122,10 @@ impl VectorTopKExec {
         scan: &ParquetScanInfo,
         vector_idx: usize,
         context: Arc<TaskContext>,
+        metrics: &VectorTopKMetricHandles,
     ) -> Result<Option<RecordBatch>> {
         let mut file_entries = Vec::new();
+        let mut candidate_rows = 0usize;
         for file_group in scan.file_groups.iter() {
             for file in file_group.files().iter() {
                 let object_path = file.path().as_ref().to_string();
@@ -125,6 +153,7 @@ impl VectorTopKExec {
                     )));
                 }
                 let candidates = index.candidate_rows(&self.query, self.options.nprobe);
+                candidate_rows += candidates.len();
                 let row_groups = read_row_group_row_counts(&local_path)?;
                 file_entries.push(FileEntry {
                     object_path,
@@ -137,6 +166,9 @@ impl VectorTopKExec {
         if file_entries.is_empty() {
             return Ok(None);
         }
+
+        metrics.index_used.add(1);
+        metrics.candidate_rows.add(candidate_rows);
 
         let mut cursor = CandidateCursor::new(file_entries.len());
         for (idx, entry) in file_entries.iter().enumerate() {
@@ -162,7 +194,7 @@ impl VectorTopKExec {
             }
 
             let access_plans = build_access_plans(&file_entries, &selections)?;
-            let plan = rewrite_with_access_plans(self.input.clone(), &access_plans)?;
+            let plan = rewrite_with_access_plans(self.scan_plan.clone(), &access_plans)?;
             let batches = collect(plan, context.clone()).await?;
             scanned += selections.values().map(|v| v.len()).sum::<usize>();
 
@@ -173,6 +205,7 @@ impl VectorTopKExec {
                     vector_idx,
                     &self.query,
                     self.k,
+                    metrics,
                 )?;
             }
         }
@@ -185,7 +218,7 @@ impl VectorTopKExec {
         });
 
         let rows = results.into_iter().map(|r| r.values).collect::<Vec<_>>();
-        let schema = self.input.schema();
+        let schema = self.scan_plan.schema();
         Ok(Some(build_batch_from_rows(schema, rows)?))
     }
 }
@@ -202,7 +235,38 @@ impl DisplayAs for VectorTopKExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "VectorTopKExec: k={}", self.k)
             }
-            DisplayFormatType::TreeRender => write!(f, ""),
+            DisplayFormatType::TreeRender => {
+                writeln!(f, "vector_topk")?;
+                writeln!(f, "k={}", self.k)?;
+                writeln!(f, "column={}", self.vector_column)?;
+                writeln!(f, "query_dim={}", self.query.len())?;
+                writeln!(f, "nprobe={}", self.options.nprobe)?;
+                writeln!(f, "batch_size={}", self.options.batch_size)?;
+                if let Some(max_candidates) = self.options.max_candidates {
+                    writeln!(f, "max_candidates={max_candidates}")?;
+                }
+                writeln!(
+                    f,
+                    "index_used={}",
+                    self.metric_handles.index_used.value() > 0
+                )?;
+                writeln!(
+                    f,
+                    "candidate_rows={}",
+                    self.metric_handles.candidate_rows.value()
+                )?;
+                writeln!(
+                    f,
+                    "embeddings_fetched={}",
+                    self.metric_handles.embeddings_fetched.value()
+                )?;
+                writeln!(
+                    f,
+                    "batches_fetched={}",
+                    self.metric_handles.batches_fetched.value()
+                )?;
+                Ok(())
+            }
         }
     }
 }
@@ -222,24 +286,23 @@ impl ExecutionPlan for VectorTopKExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+        vec![]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
+        vec![]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(VectorTopKExec::new(
-            children[0].clone(),
-            self.vector_column.clone(),
-            self.query.clone(),
-            self.k,
-            self.options.clone(),
-        )))
+        if !children.is_empty() {
+            return Err(DataFusionError::Plan(
+                "VectorTopKExec does not accept children".to_string(),
+            ));
+        }
+        Ok(self)
     }
 
     fn execute(
@@ -250,15 +313,55 @@ impl ExecutionPlan for VectorTopKExec {
         assert_eq_or_internal_err!(partition, 0, "VectorTopKExec invalid partition");
         let schema = self.schema();
         let this = self.clone();
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let metric_handles = self.metric_handles.clone();
         let stream = stream::once(async move {
-            let batch = this.execute_topk(context).await?;
+            let batch = this.execute_topk(context, &metric_handles).await?;
+            let batch = batch.record_output(&baseline_metrics);
+            baseline_metrics.done();
             Ok(batch)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn statistics(&self) -> Result<Statistics> {
         Ok(Statistics::new_unknown(&self.schema()))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VectorTopKMetricHandles {
+    index_used: Count,
+    candidate_rows: Count,
+    embeddings_fetched: Count,
+    batches_fetched: Count,
+}
+
+impl VectorTopKMetricHandles {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            index_used: MetricBuilder::new(metrics)
+                .with_type(MetricType::SUMMARY)
+                .counter("index_used", partition),
+            candidate_rows: MetricBuilder::new(metrics)
+                .with_type(MetricType::SUMMARY)
+                .counter("candidate_rows", partition),
+            embeddings_fetched: MetricBuilder::new(metrics)
+                .with_type(MetricType::SUMMARY)
+                .counter("embeddings_fetched", partition),
+            batches_fetched: MetricBuilder::new(metrics)
+                .with_type(MetricType::DEV)
+                .counter("batches_fetched", partition),
+        }
+    }
+
+    fn record_batch(&self, batch: &RecordBatch) {
+        self.embeddings_fetched.add(batch.num_rows());
+        self.batches_fetched.add(1);
     }
 }
 
@@ -295,10 +398,11 @@ fn compute_topk_from_batches(
     vector_idx: usize,
     query: &[f32],
     k: usize,
+    metrics: &VectorTopKMetricHandles,
 ) -> Result<Vec<Vec<ScalarValue>>> {
     let mut heap = BinaryHeap::new();
     for batch in batches {
-        update_topk_heap(&mut heap, batch, vector_idx, query, k)?;
+        update_topk_heap(&mut heap, batch, vector_idx, query, k, metrics)?;
     }
     let mut rows: Vec<TopKRow> = heap.into_iter().collect();
     rows.sort_by(|a, b| {
@@ -315,7 +419,9 @@ fn update_topk_heap(
     vector_idx: usize,
     query: &[f32],
     k: usize,
+    metrics: &VectorTopKMetricHandles,
 ) -> Result<()> {
+    metrics.record_batch(batch);
     let vector_array = batch.column(vector_idx);
     for row in 0..batch.num_rows() {
         let distance = match compute_distance(vector_array, row, query)? {

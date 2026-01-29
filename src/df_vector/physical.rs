@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use datafusion::common::ScalarValue;
 use datafusion::common::{Result, config::ConfigOptions};
-use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion::physical_expr::expressions::{CastExpr, Column, Literal, TryCastExpr};
+use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
-use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
 use super::exec::VectorTopKExec;
 use super::expr::scalar_to_f32_list;
@@ -41,9 +41,7 @@ impl VectorTopKPhysicalOptimizerRule {
                         && merge.expr()[0] == sort.expr()[0]
                         && sort.preserve_partitioning()
                     {
-                        if let Some(topk) =
-                            self.build_topk_from_sort_merge(sort, merge.fetch())?
-                        {
+                        if let Some(topk) = self.build_topk_from_sort_merge(sort, merge.fetch())? {
                             return Ok(topk);
                         }
                     }
@@ -189,9 +187,7 @@ impl PhysicalOptimizerRule for VectorTopKPhysicalOptimizerRule {
     }
 }
 
-fn extract_array_distance_physical(
-    expr: &Arc<dyn PhysicalExpr>,
-) -> Option<(String, Vec<f32>)> {
+fn extract_array_distance_physical(expr: &Arc<dyn PhysicalExpr>) -> Option<(String, Vec<f32>)> {
     let expr = strip_wrappers(expr);
     let scalar = expr.as_any().downcast_ref::<ScalarFunctionExpr>()?;
     if scalar.name() != "array_distance" || scalar.args().len() != 2 {

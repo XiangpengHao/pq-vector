@@ -1,15 +1,17 @@
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, ListArray};
 use arrow::array::types::Float32Type;
+use arrow::array::{Array, Float32Array, Int32Array, ListArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::displayable;
-use datafusion::prelude::{ParquetReadOptions, SessionContext};
+use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+use insta::assert_snapshot;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 
-use crate::ivf::{build_index, IvfBuildParams};
 use super::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
+use crate::ivf::{IvfBuildParams, build_index};
 
 #[tokio::test]
 async fn vector_topk_end_to_end() -> datafusion::common::Result<()> {
@@ -42,8 +44,7 @@ async fn vector_topk_end_to_end() -> datafusion::common::Result<()> {
     )?;
 
     let file = std::fs::File::create(&source_path).unwrap();
-    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None)
-        .unwrap();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 
@@ -60,11 +61,11 @@ async fn vector_topk_end_to_end() -> datafusion::common::Result<()> {
         batch_size: 1024,
         max_candidates: None,
     };
+    let config = SessionConfig::new().with_target_partitions(2);
     let state = SessionStateBuilder::new()
+        .with_config(config)
         .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(
-            VectorTopKPhysicalOptimizerRule::new(options),
-        ))
+        .with_physical_optimizer_rule(Arc::new(VectorTopKPhysicalOptimizerRule::new(options)))
         .build();
     let ctx = SessionContext::new_with_state(state);
 
@@ -87,13 +88,7 @@ async fn vector_topk_end_to_end() -> datafusion::common::Result<()> {
         .unwrap();
 
     let plan = df.clone().create_physical_plan().await?;
-    let plan_str = displayable(plan.as_ref()).indent(false).to_string();
-    assert!(
-        plan_str.contains("VectorTopKExec"),
-        "expected VectorTopKExec in plan, got: {plan_str}"
-    );
-
-    let batches = df.collect().await?;
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
     let mut result_ids = Vec::new();
     for batch in batches {
         let ids = batch
@@ -107,5 +102,94 @@ async fn vector_topk_end_to_end() -> datafusion::common::Result<()> {
     }
 
     assert_eq!(result_ids, vec![5, 2]);
+
+    let tree_str = displayable(plan.as_ref()).tree_render().to_string();
+    assert_snapshot!("vector_topk_plan_tree", tree_str);
     Ok(())
+}
+
+#[tokio::test]
+async fn vector_topk_vldb_tree_snapshot() -> datafusion::common::Result<()> {
+    let source_path = std::path::Path::new("data/vldb_2025.parquet");
+    let indexed_path = std::path::Path::new("data/vldb_2025_indexed.parquet");
+    if !source_path.exists() || !indexed_path.exists() {
+        return Ok(());
+    }
+
+    let options = VectorTopKOptions {
+        nprobe: 32,
+        batch_size: 1024,
+        max_candidates: Some(2048),
+    };
+    let ctx = build_context(options);
+    ctx.register_parquet(
+        "t",
+        indexed_path.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let query_vec = get_embedding_at_row(indexed_path, "embedding", 0)?;
+    let query_literal = format!(
+        "[{}]",
+        query_vec
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let sql = format!(
+        "SELECT title FROM t \
+         ORDER BY array_distance(embedding, {query_literal}) \
+         LIMIT 3"
+    );
+    let df = ctx.sql(&sql).await.unwrap();
+    let plan = df.clone().create_physical_plan().await?;
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+    assert!(!batches.is_empty());
+
+    let tree_str = displayable(plan.as_ref()).tree_render().to_string();
+    assert_snapshot!("vector_topk_vldb_tree", tree_str);
+    Ok(())
+}
+
+fn build_context(options: VectorTopKOptions) -> SessionContext {
+    let config = SessionConfig::new().with_target_partitions(2);
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(VectorTopKPhysicalOptimizerRule::new(options)))
+        .build();
+    SessionContext::new_with_state(state)
+}
+
+fn get_embedding_at_row(
+    path: &std::path::Path,
+    column_name: &str,
+    row: usize,
+) -> datafusion::common::Result<Vec<f32>> {
+    let file = std::fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut current_row = 0;
+    for batch in reader {
+        let batch = batch?;
+        let embedding_col = batch.column_by_name(column_name).unwrap();
+        let list_array = embedding_col.as_any().downcast_ref::<ListArray>().unwrap();
+
+        if row < current_row + list_array.len() {
+            let local_row = row - current_row;
+            let start = list_array.value_offsets()[local_row] as usize;
+            let end = list_array.value_offsets()[local_row + 1] as usize;
+            let values = list_array.values();
+            let float_array = values.as_any().downcast_ref::<Float32Array>().unwrap();
+            return Ok((start..end).map(|i| float_array.value(i)).collect());
+        }
+        current_row += list_array.len();
+    }
+    Err(datafusion::common::DataFusionError::Execution(
+        "Row not found".to_string(),
+    ))
 }

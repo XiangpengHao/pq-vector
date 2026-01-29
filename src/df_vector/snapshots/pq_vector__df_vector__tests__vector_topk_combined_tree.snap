@@ -1,0 +1,28 @@
+---
+source: src/df_vector/tests.rs
+expression: tree_str
+---
+┌───────────────────────────┐
+│       ProjectionExec      │
+│    --------------------   │
+│        title: title       │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│       VectorTopKExec      │
+│    --------------------   │
+│      batch_size: 1024     │
+│     batches_fetched: 1    │
+│    candidate_rows: 1407   │
+│     column: embedding     │
+│                           │
+│    embeddings_fetched:    │
+│            1024           │
+│                           │
+│      index_used: true     │
+│            k: 3           │
+│    max_candidates: 4096   │
+│         nprobe: 16        │
+│      query_dim: 4096      │
+│                           │
+│        vector_topk        │
+└───────────────────────────┘
