@@ -3,6 +3,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use std::cmp::Ordering;
 use std::num::NonZeroU32;
+use std::thread;
 
 /// IVF index structure (in-memory representation).
 pub(crate) struct IvfIndex {
@@ -179,19 +180,29 @@ pub(crate) fn build_ivf_index(
     };
 
     let (centroids, _) = if sample_size == n_vectors {
-        kmeans(embeddings, kmeans_params)
+        k_means(embeddings, kmeans_params)
     } else {
         let sample = sample_embeddings(embeddings, sample_size, config.seed)?;
-        kmeans(&sample, kmeans_params)
+        k_means(&sample, kmeans_params)
     };
 
-    let mut inverted_lists = vec![Vec::new(); n_clusters.as_usize()];
+    let n_clusters_usize = n_clusters.as_usize();
     let dim = embeddings.dim().as_usize();
     let data = embeddings.data();
-    for row_idx in 0..n_vectors {
-        let vec = &data[row_idx * dim..(row_idx + 1) * dim];
-        let cluster_idx = nearest_centroid(vec, &centroids, dim);
-        inverted_lists[cluster_idx].push(row_idx as u32);
+    let mut inverted_lists = vec![Vec::new(); n_clusters_usize];
+    let locals = parallel_ranges(n_vectors, |start, end| {
+        let mut local_lists = vec![Vec::new(); n_clusters_usize];
+        for row_idx in start..end {
+            let vec = &data[row_idx * dim..(row_idx + 1) * dim];
+            let cluster_idx = nearest_centroid(vec, &centroids, dim);
+            local_lists[cluster_idx].push(row_idx as u32);
+        }
+        local_lists
+    });
+    for mut local_lists in locals {
+        for (cluster_idx, local) in local_lists.iter_mut().enumerate() {
+            inverted_lists[cluster_idx].append(local);
+        }
     }
 
     Ok(IvfIndex {
@@ -245,75 +256,177 @@ fn nearest_centroid(vec: &[f32], centroids: &[f32], dim: usize) -> usize {
     best_cluster
 }
 
+fn worker_count(len: usize) -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(len)
+        .max(1)
+}
+
+fn parallel_ranges<R, F>(len: usize, f: F) -> Vec<R>
+where
+    R: Send,
+    F: Fn(usize, usize) -> R + Sync,
+{
+    if len == 0 {
+        return Vec::new();
+    }
+    let workers = worker_count(len);
+    let chunk_size = len.div_ceil(workers);
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        let f = &f;
+        for chunk_idx in 0..workers {
+            let start = chunk_idx * chunk_size;
+            if start >= len {
+                break;
+            }
+            let end = (start + chunk_size).min(len);
+            let handle = scope.spawn(move || f(start, end));
+            handles.push(handle);
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker thread panicked"))
+            .collect()
+    })
+}
+
+fn parallel_chunks_mut<T, R, F>(data: &mut [T], f: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(usize, &mut [T]) -> R + Sync,
+{
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let workers = worker_count(data.len());
+    let chunk_size = data.len().div_ceil(workers);
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        let f = &f;
+        for (chunk_idx, chunk) in data.chunks_mut(chunk_size).enumerate() {
+            let start = chunk_idx * chunk_size;
+            let handle = scope.spawn(move || f(start, chunk));
+            handles.push(handle);
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker thread panicked"))
+            .collect()
+    })
+}
+
 /// K-means clustering implementation with k-means++ initialization.
-fn kmeans(embeddings: &Embeddings, params: KMeansParams) -> (Vec<f32>, Vec<usize>) {
+fn k_means(embeddings: &Embeddings, params: KMeansParams) -> (Vec<f32>, Vec<usize>) {
     let dim = embeddings.dim().as_usize();
     let n = embeddings.row_count();
     let data = embeddings.data();
     let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
 
-    let mut centroids = vec![0.0f32; params.n_clusters.as_usize() * dim];
+    let n_clusters = params.n_clusters.as_usize();
+    let mut centroids = vec![0.0f32; n_clusters * dim];
 
-    let first_idx = rng.gen_range(0..n);
+    let init_sample_size = n.min(50_000).max(n_clusters);
+    let init_indices: Vec<usize> = if init_sample_size == n {
+        (0..n).collect()
+    } else {
+        use rand::seq::index::sample;
+        sample(&mut rng, n, init_sample_size).iter().collect()
+    };
+
+    let first_choice = rng.gen_range(0..init_indices.len());
+    let first_idx = init_indices[first_choice];
     centroids[..dim].copy_from_slice(&data[first_idx * dim..(first_idx + 1) * dim]);
 
-    for i in 1..params.n_clusters.as_usize() {
-        let distances: Vec<f32> = (0..n)
-            .map(|j| {
-                let vec = &data[j * dim..(j + 1) * dim];
-                (0..i)
-                    .map(|c| {
-                        let centroid = &centroids[c * dim..(c + 1) * dim];
-                        squared_l2_distance(vec, centroid)
-                    })
-                    .fold(f32::INFINITY, |a, b| a.min(b))
-            })
-            .collect();
+    let mut min_distances = vec![0.0f32; init_indices.len()];
+    parallel_chunks_mut(&mut min_distances, |start, dist_chunk| {
+        let indices = &init_indices[start..start + dist_chunk.len()];
+        let centroid = &centroids[..dim];
+        for (&row_idx, dist_slot) in indices.iter().zip(dist_chunk.iter_mut()) {
+            let vec = &data[row_idx * dim..(row_idx + 1) * dim];
+            *dist_slot = squared_l2_distance(vec, centroid);
+        }
+    });
 
-        let total: f32 = distances.iter().sum();
+    for i in 1..n_clusters {
+        let centroid = &centroids[(i - 1) * dim..i * dim];
+        let partial_sums: Vec<f32> =
+            parallel_chunks_mut(&mut min_distances, |start, dist_chunk| {
+                let indices = &init_indices[start..start + dist_chunk.len()];
+                let mut local_sum = 0.0f32;
+                for (&row_idx, dist_slot) in indices.iter().zip(dist_chunk.iter_mut()) {
+                    let vec = &data[row_idx * dim..(row_idx + 1) * dim];
+                    let dist = squared_l2_distance(vec, centroid);
+                    if dist < *dist_slot {
+                        *dist_slot = dist;
+                    }
+                    local_sum += *dist_slot;
+                }
+                local_sum
+            });
+        let total: f32 = partial_sums.into_iter().sum();
+
         if total > 0.0 {
             let threshold = rng.gen_range(0.0..1.0) * total;
             let mut cumsum = 0.0;
-            for (j, &d) in distances.iter().enumerate() {
+            for (slot, &d) in min_distances.iter().enumerate() {
                 cumsum += d;
                 if cumsum >= threshold {
+                    let row_idx = init_indices[slot];
                     centroids[i * dim..(i + 1) * dim]
-                        .copy_from_slice(&data[j * dim..(j + 1) * dim]);
+                        .copy_from_slice(&data[row_idx * dim..(row_idx + 1) * dim]);
                     break;
                 }
             }
         } else {
-            let idx = rng.gen_range(0..n);
-            centroids[i * dim..(i + 1) * dim].copy_from_slice(&data[idx * dim..(idx + 1) * dim]);
+            let choice = rng.gen_range(0..init_indices.len());
+            let row_idx = init_indices[choice];
+            centroids[i * dim..(i + 1) * dim]
+                .copy_from_slice(&data[row_idx * dim..(row_idx + 1) * dim]);
         }
     }
 
     let mut assignments = vec![0usize; n];
-    let mut cluster_sizes = vec![0usize; params.n_clusters.as_usize()];
+    let mut cluster_sizes = vec![0usize; n_clusters];
 
     for _iter in 0..params.max_iters {
         let mut changed = 0;
         cluster_sizes.fill(0);
+        let results: Vec<(usize, Vec<usize>)> =
+            parallel_chunks_mut(&mut assignments, |start, assignment_chunk| {
+                let mut local_changed = 0usize;
+                let mut local_sizes = vec![0usize; n_clusters];
+                for (offset, slot) in assignment_chunk.iter_mut().enumerate() {
+                    let row_idx = start + offset;
+                    let vec = &data[row_idx * dim..(row_idx + 1) * dim];
+                    let mut best_cluster = 0;
+                    let mut best_dist = f32::INFINITY;
 
-        for i in 0..n {
-            let vec = &data[i * dim..(i + 1) * dim];
-            let mut best_cluster = 0;
-            let mut best_dist = f32::INFINITY;
+                    for j in 0..n_clusters {
+                        let centroid = &centroids[j * dim..(j + 1) * dim];
+                        let dist = squared_l2_distance(vec, centroid);
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_cluster = j;
+                        }
+                    }
 
-            for j in 0..params.n_clusters.as_usize() {
-                let centroid = &centroids[j * dim..(j + 1) * dim];
-                let dist = squared_l2_distance(vec, centroid);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_cluster = j;
+                    if *slot != best_cluster {
+                        local_changed += 1;
+                    }
+                    *slot = best_cluster;
+                    local_sizes[best_cluster] += 1;
                 }
+                (local_changed, local_sizes)
+            });
+        for (local_changed, local_sizes) in results {
+            changed += local_changed;
+            for (idx, size) in local_sizes.into_iter().enumerate() {
+                cluster_sizes[idx] += size;
             }
-
-            if assignments[i] != best_cluster {
-                changed += 1;
-            }
-            assignments[i] = best_cluster;
-            cluster_sizes[best_cluster] += 1;
         }
 
         if changed == 0 {
@@ -330,7 +443,7 @@ fn kmeans(embeddings: &Embeddings, params: KMeansParams) -> (Vec<f32>, Vec<usize
             }
         }
 
-        for j in 0..params.n_clusters.as_usize() {
+        for j in 0..n_clusters {
             if cluster_sizes[j] > 0 {
                 let size = cluster_sizes[j] as f32;
                 for d in 0..dim {
@@ -347,13 +460,23 @@ fn kmeans(embeddings: &Embeddings, params: KMeansParams) -> (Vec<f32>, Vec<usize
 #[inline]
 pub(crate) fn squared_l2_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let diff = x - y;
-            diff * diff
-        })
-        .sum()
+    let mut sum = 0.0f32;
+    let mut i = 0usize;
+    let len = a.len();
+    while i + 4 <= len {
+        let d0 = a[i] - b[i];
+        let d1 = a[i + 1] - b[i + 1];
+        let d2 = a[i + 2] - b[i + 2];
+        let d3 = a[i + 3] - b[i + 3];
+        sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+        i += 4;
+    }
+    while i < len {
+        let d = a[i] - b[i];
+        sum += d * d;
+        i += 1;
+    }
+    sum
 }
 
 #[cfg(test)]

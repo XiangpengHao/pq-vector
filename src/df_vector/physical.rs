@@ -181,12 +181,13 @@ impl VectorTopKPhysicalOptimizerRule {
         for file_group in scan.file_groups.iter() {
             for file in file_group.files().iter() {
                 file_count += 1;
-                let local_path =
-                    match local_path_from_object_store(&scan.object_store_url, file.path().as_ref())
-                    {
-                        Some(path) => path,
-                        None => return Ok(false),
-                    };
+                let local_path = match local_path_from_object_store(
+                    &scan.object_store_url,
+                    file.path().as_ref(),
+                ) {
+                    Some(path) => path,
+                    None => return Ok(false),
+                };
                 let embedding = match read_index_metadata(&local_path) {
                     Ok(metadata) => metadata,
                     Err(_) => return Ok(false),

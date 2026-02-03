@@ -1,18 +1,16 @@
+mod bench_util;
+
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Float32Builder, Int32Builder, ListBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use arrow::array::Int32Array;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
-use parquet::arrow::ArrowWriter;
 use pq_vector::IndexBuilder;
-use pq_vector::df_vector::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use pq_vector::df_vector::{PqVectorSessionBuilderExt, VectorTopKOptions};
+
+use bench_util::{array_literal, generate_parquet, random_query, to_mb};
 
 const ROWS: usize = 1_000_000;
 const DIM: usize = 1024;
@@ -58,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plain_start = Instant::now();
     let plain_batches = plain_ctx.sql(&sql).await?.collect().await?;
     let plain_time = plain_start.elapsed();
+    let plain_ids = extract_ids(&plain_batches);
     let plain_rows: usize = plain_batches.iter().map(|b| b.num_rows()).sum();
     println!("Query time (no index): {:.2?}", plain_time);
     println!("Returned rows: {plain_rows}");
@@ -83,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state = SessionStateBuilder::new()
         .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(VectorTopKPhysicalOptimizerRule::new(options)))
+        .with_pq_vector(options)
         .build();
     let ctx = SessionContext::new_with_state(state);
 
@@ -96,79 +95,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let indexed_start = Instant::now();
     let indexed_batches = ctx.sql(&sql).await?.collect().await?;
     let indexed_time = indexed_start.elapsed();
+    let indexed_ids = extract_ids(&indexed_batches);
     let indexed_rows: usize = indexed_batches.iter().map(|b| b.num_rows()).sum();
     println!("Query time (with index): {:.2?}", indexed_time);
     println!("Returned rows: {indexed_rows}");
 
+    let recall = recall_at_k(&plain_ids, &indexed_ids);
+    println!("Recall@{K}: {:.2}%", recall * 100.0);
+
     Ok(())
 }
 
-fn generate_parquet(
-    path: &Path,
-    rows: usize,
-    dim: usize,
-    batch_rows: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new(
-            "embedding",
-            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
-            false,
-        ),
-    ]));
-
-    let file = fs::File::create(path)?;
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
-    let mut rng = StdRng::seed_from_u64(1234);
-
-    let mut row = 0usize;
-    while row < rows {
-        let count = (rows - row).min(batch_rows);
-        let mut id_builder = Int32Builder::with_capacity(count);
-        let mut list_builder = ListBuilder::new(Float32Builder::with_capacity(count * dim));
-
-        for i in 0..count {
-            id_builder.append_value((row + i) as i32);
-            for _ in 0..dim {
-                list_builder.values().append_value(rng.r#gen::<f32>());
-            }
-            list_builder.append(true);
+fn extract_ids(batches: &[arrow::record_batch::RecordBatch]) -> Vec<i32> {
+    let mut ids = Vec::new();
+    for batch in batches {
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be int32");
+        for i in 0..array.len() {
+            ids.push(array.value(i));
         }
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(id_builder.finish()),
-                Arc::new(list_builder.finish()),
-            ],
-        )?;
-        writer.write(&batch)?;
-        row += count;
     }
-
-    writer.close()?;
-    Ok(())
+    ids
 }
 
-fn random_query(dim: usize, seed: u64) -> Vec<f32> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    (0..dim).map(|_| rng.r#gen::<f32>()).collect()
-}
-
-fn array_literal(values: &[f32]) -> String {
-    let mut out = String::with_capacity(values.len() * 10);
-    out.push('[');
-    for (idx, value) in values.iter().enumerate() {
-        if idx > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&value.to_string());
+fn recall_at_k(ground_truth: &[i32], candidates: &[i32]) -> f64 {
+    if ground_truth.is_empty() {
+        return 0.0;
     }
-    out.push(']');
-    out
-}
-
-fn to_mb(bytes: u64) -> f64 {
-    bytes as f64 / 1024.0 / 1024.0
+    let truth: std::collections::HashSet<i32> = ground_truth.iter().copied().collect();
+    let hits = candidates.iter().filter(|id| truth.contains(id)).count();
+    hits as f64 / ground_truth.len() as f64
 }

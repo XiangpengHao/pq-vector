@@ -79,12 +79,9 @@ impl VectorTopKExec {
         context: Arc<TaskContext>,
         metrics: &VectorTopKMetricHandles,
     ) -> Result<RecordBatch> {
-        let scan_info = gather_single_parquet_scan(&self.scan_plan)?
-            .ok_or_else(|| {
-                DataFusionError::Plan(
-                    "VectorTopKExec requires a single parquet scan input".to_string(),
-                )
-            })?;
+        let scan_info = gather_single_parquet_scan(&self.scan_plan)?.ok_or_else(|| {
+            DataFusionError::Plan("VectorTopKExec requires a single parquet scan input".to_string())
+        })?;
         self.execute_with_index(&scan_info, context, metrics).await
     }
 

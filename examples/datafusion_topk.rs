@@ -6,8 +6,8 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use pq_vector::df_vector::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
 use pq_vector::IndexBuilder;
+use pq_vector::df_vector::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,8 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let embedding_column = "embedding";
 
     if !indexed_path.exists() {
-        IndexBuilder::new(source_path, embedding_column)
-            .build_new(indexed_path)?;
+        IndexBuilder::new(source_path, embedding_column).build_new(indexed_path)?;
     }
 
     let options = VectorTopKOptions {

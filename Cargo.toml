@@ -22,9 +22,12 @@ tempfile = "3"
 opt-level = 3
 
 [[bench]]
-name = "benchmark"
-path = "benches/benchmark.rs"
+name = "index_build"
+path = "benches/index_build.rs"
 harness = false
 
-[patch.crates-io]
-datafusion = { git = "https://github.com/apache/datafusion.git", branch = "main" }
+[[bench]]
+name = "query"
+path = "benches/query.rs"
+harness = false
+

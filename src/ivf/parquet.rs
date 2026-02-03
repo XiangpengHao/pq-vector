@@ -32,15 +32,12 @@ impl IndexBuilder {
             source: source.as_ref().to_path_buf(),
             embedding_column: embedding_column.as_ref().to_string(),
             n_clusters: None,
-            max_iters: 7,
+            max_iters: 20,
             seed: 42,
         }
     }
 
-    pub fn n_clusters(
-        mut self,
-        n_clusters: usize,
-    ) -> Self {
+    pub fn n_clusters(mut self, n_clusters: usize) -> Self {
         self.n_clusters = Some(n_clusters);
         self
     }
