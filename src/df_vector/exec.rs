@@ -6,28 +6,30 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray, RecordBatch};
+use arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
+    RecordBatch,
+};
 use arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result, ScalarValue, assert_eq_or_internal_err};
+use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricType,
-    MetricsSet, RecordOutput,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricType, MetricsSet,
+    RecordOutput,
 };
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics, collect,
 };
-use datafusion::execution::TaskContext;
 use futures::stream;
 
 use crate::ivf::read_index_from_parquet;
 
 use super::access::{
-    CandidateCursor, FileEntry, ParquetScanInfo, build_access_plans,
-    gather_single_parquet_scan, local_path_from_object_store, read_row_group_row_counts,
-    rewrite_with_access_plans,
+    CandidateCursor, FileEntry, ParquetScanInfo, build_access_plans, gather_single_parquet_scan,
+    local_path_from_object_store, read_row_group_row_counts, rewrite_with_access_plans,
 };
 use super::options::VectorTopKOptions;
 
@@ -78,14 +80,12 @@ impl VectorTopKExec {
         metrics: &VectorTopKMetricHandles,
     ) -> Result<RecordBatch> {
         let schema = self.scan_plan.schema();
-        let vector_idx = schema
-            .index_of(&self.vector_column)
-            .map_err(|_| {
-                DataFusionError::Plan(format!(
-                    "Vector column '{}' not found in schema",
-                    self.vector_column
-                ))
-            })?;
+        let vector_idx = schema.index_of(&self.vector_column).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "Vector column '{}' not found in schema",
+                self.vector_column
+            ))
+        })?;
 
         let scan_info = match gather_single_parquet_scan(&self.scan_plan) {
             Ok(info) => info,
@@ -93,13 +93,8 @@ impl VectorTopKExec {
         };
 
         if let Some(scan_info) = scan_info {
-            if let Some(result) =
-                self.try_execute_with_index(
-                    &scan_info,
-                    vector_idx,
-                    context.clone(),
-                    metrics,
-                )
+            if let Some(result) = self
+                .try_execute_with_index(&scan_info, vector_idx, context.clone(), metrics)
                 .await?
             {
                 return Ok(result);
@@ -107,13 +102,7 @@ impl VectorTopKExec {
         }
 
         let batches = collect(self.scan_plan.clone(), context).await?;
-        let topk = compute_topk_from_batches(
-            &batches,
-            vector_idx,
-            &self.query,
-            self.k,
-            metrics,
-        )?;
+        let topk = compute_topk_from_batches(&batches, vector_idx, &self.query, self.k, metrics)?;
         build_batch_from_rows(schema, topk)
     }
 
@@ -129,20 +118,18 @@ impl VectorTopKExec {
         for file_group in scan.file_groups.iter() {
             for file in file_group.files().iter() {
                 let object_path = file.path().as_ref().to_string();
-                let local_path = local_path_from_object_store(
-                    &scan.object_store_url,
-                    file.path().as_ref(),
-                )
-                .ok_or_else(|| {
-                    DataFusionError::Plan(
-                        "VectorTopK only supports local file:// paths".to_string(),
-                    )
-                })?;
+                let local_path =
+                    local_path_from_object_store(&scan.object_store_url, file.path().as_ref())
+                        .ok_or_else(|| {
+                            DataFusionError::Plan(
+                                "VectorTopK only supports local file:// paths".to_string(),
+                            )
+                        })?;
                 let (index, embedding_column) = match read_index_from_parquet(&local_path) {
                     Ok(index) => index,
                     Err(_) => return Ok(None),
                 };
-                if embedding_column != self.vector_column {
+                if embedding_column.as_str() != self.vector_column {
                     return Ok(None);
                 }
                 if index.dim() != self.query.len() {
@@ -199,14 +186,7 @@ impl VectorTopKExec {
             scanned += selections.values().map(|v| v.len()).sum::<usize>();
 
             for batch in batches {
-                update_topk_heap(
-                    &mut heap,
-                    &batch,
-                    vector_idx,
-                    &self.query,
-                    self.k,
-                    metrics,
-                )?;
+                update_topk_heap(&mut heap, &batch, vector_idx, &self.query, self.k, metrics)?;
             }
         }
 

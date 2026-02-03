@@ -172,7 +172,8 @@ fn build_row_selection(row_count: usize, rows: &[u32]) -> Result<RowSelection> {
 
 pub(crate) fn read_row_group_row_counts(path: &Path) -> Result<Vec<u64>> {
     let file = std::fs::File::open(path).map_err(datafusion::common::DataFusionError::from)?;
-    let reader = SerializedFileReader::new(file).map_err(datafusion::common::DataFusionError::from)?;
+    let reader =
+        SerializedFileReader::new(file).map_err(datafusion::common::DataFusionError::from)?;
     let metadata = reader.metadata();
     let counts = metadata
         .row_groups()

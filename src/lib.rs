@@ -10,18 +10,33 @@
 //! ## Example
 //!
 //! ```ignore
-//! use pq_vector::{build_index, topk, IvfBuildParams};
+//! use pq_vector::{
+//!     EmbeddingColumn,
+//!     IndexBuilder,
+//!     InplaceIndexBuilder,
+//!     IvfBuildParams,
+//!     TopkBuilder,
+//! };
 //! use std::path::Path;
 //!
 //! // Build index
-//! build_index(source, output, "embedding", &IvfBuildParams::default())?;
+//! IndexBuilder::new(source, output, EmbeddingColumn::try_from("embedding")?)
+//!     .params(IvfBuildParams::default())
+//!     .build()?;
 //!
 //! // Query with Rust API
 //! let query_vector = vec![1.0f32, 2.0f32];
-//! let results = topk(Path::new("file.parquet"), &query_vector, 10, 5).await?;
+//! let results = TopkBuilder::new(Path::new("file.parquet"), &query_vector)
+//!     .k(10)?
+//!     .nprobe(5)?
+//!     .search()
+//!     .await?;
 //! ```
 
 pub mod df_vector;
 pub mod ivf;
 
-pub use ivf::{IvfBuildParams, SearchResult, build_index, build_index_inplace, topk};
+pub use ivf::{
+    ClusterCount, EmbeddingColumn, IndexBuilder, InplaceIndexBuilder, IvfBuildParams, SearchResult,
+    TopkBuilder,
+};

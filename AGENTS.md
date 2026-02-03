@@ -10,3 +10,8 @@
 1. Ask if you think one instruction is ambiguous.
 2. Ask if you're unsure which alternative is better.
 3. Always run cargo check after coding.
+
+# Session learnings
+
+- Prefer builder-style APIs over request structs for ergonomics.
+- Split modules by cognitive boundary; keep types with their implementations.

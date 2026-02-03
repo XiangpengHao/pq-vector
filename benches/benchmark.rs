@@ -1,6 +1,6 @@
 use arrow::array::{Array, Float32Array, ListArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pq_vector::{build_index, topk, IvfBuildParams};
+use pq_vector::{EmbeddingColumn, IndexBuilder, IvfBuildParams, TopkBuilder};
 use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::time::Instant;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compressed_path = Path::new("data/combined_lz4.parquet");
     let indexed_path = Path::new("data/combined_indexed.parquet");
-    let embedding_column = "embedding";
+    let embedding_column = EmbeddingColumn::try_from("embedding")?;
 
     let compressed_size = fs::metadata(compressed_path)?.len();
     println!(
@@ -26,7 +26,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_iters: 20,
         seed: 42,
     };
-    build_index(compressed_path, indexed_path, embedding_column, &params)?;
+    IndexBuilder::new(compressed_path, indexed_path, embedding_column.clone())
+        .params(params)
+        .build()?;
     let build_time = start.elapsed();
     println!("Build time: {:.2}s", build_time.as_secs_f64());
 
@@ -42,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Load all embeddings for brute force and recall calculation
-    let (all_embeddings, dim) = read_all_embeddings(indexed_path, embedding_column)?;
+    let (all_embeddings, dim) = read_all_embeddings(indexed_path, embedding_column.as_str())?;
     let n_vectors = all_embeddings.len() / dim;
     println!("\nDataset: {} vectors, dim={}", n_vectors, dim);
 
@@ -58,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..iterations {
         for &qr in &query_rows {
             // Read all embeddings from parquet file (this is what brute force must do)
-            let (embs, d) = read_all_embeddings(compressed_path, embedding_column)?;
+            let (embs, d) = read_all_embeddings(compressed_path, embedding_column.as_str())?;
             let query = &embs[qr * d..(qr + 1) * d];
             let _ = brute_force_topk(&embs, d, query, k);
         }
@@ -100,7 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..iterations {
             for &qr in &query_rows {
                 let query = &all_embeddings[qr * dim..(qr + 1) * dim];
-                let _ = topk(indexed_path, query, k, nprobe).await?;
+                let _ = TopkBuilder::new(indexed_path, query)
+                    .k(k)?
+                    .nprobe(nprobe)?
+                    .search()
+                    .await?;
             }
         }
         let ivf_time = start.elapsed().as_secs_f64() / (iterations * query_rows.len()) as f64;
@@ -116,7 +122,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bf_results.iter().map(|(idx, _)| *idx).collect();
 
             // IVF results
-            let ivf_results = topk(indexed_path, query, k, nprobe).await?;
+            let ivf_results = TopkBuilder::new(indexed_path, query)
+                .k(k)?
+                .nprobe(nprobe)?
+                .search()
+                .await?;
             let ivf_set: std::collections::HashSet<usize> =
                 ivf_results.iter().map(|r| r.row_idx as usize).collect();
 
@@ -137,7 +147,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
 
 fn read_all_embeddings(
     path: &Path,

@@ -9,7 +9,7 @@
 
 use arrow::array::{Array, Float32Array, ListArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pq_vector::{build_index, topk, IvfBuildParams};
+use pq_vector::{ClusterCount, EmbeddingColumn, IndexBuilder, IvfBuildParams, TopkBuilder};
 use std::cmp::Ordering;
 use std::fs::File;
 use std::path::Path;
@@ -18,20 +18,22 @@ use std::path::Path;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_path = Path::new("data/vldb_2025.parquet");
     let output_path = Path::new("data/vldb_2025_indexed.parquet");
-    let embedding_column = "embedding";
+    let embedding_column = EmbeddingColumn::try_from("embedding")?;
 
     // Build the index with more clusters for a realistic test
     // With sqrt(496)≈22 clusters, most neighbors end up in the same cluster
     // Use 50 clusters to show the recall/nprobe tradeoff
     let params = IvfBuildParams {
-        n_clusters: Some(50),
+        n_clusters: Some(ClusterCount::new(50)?),
         max_iters: 20,
         ..Default::default()
     };
-    build_index(source_path, output_path, embedding_column, &params)?;
+    IndexBuilder::new(source_path, output_path, embedding_column.clone())
+        .params(params)
+        .build()?;
 
     // Load all embeddings for brute force comparison
-    let (embeddings, dim) = read_embeddings(output_path, embedding_column)?;
+    let (embeddings, dim) = read_embeddings(output_path, embedding_column.as_str())?;
     let n_vectors = embeddings.len() / dim;
 
     // Test multiple queries
@@ -45,7 +47,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let query = &embeddings[query_row * dim..(query_row + 1) * dim];
 
         // IVF search with full nprobe (should be exact)
-        let ivf_results = topk(output_path, query, k, 50).await?; // 50 = n_clusters
+        let ivf_results = TopkBuilder::new(output_path, query)
+            .k(k)?
+            .nprobe(50)?
+            .search()
+            .await?; // 50 = n_clusters
 
         // Brute force search
         let bf_results = brute_force_topk(&embeddings, dim, query, k);
@@ -72,7 +78,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bf_rows: Vec<u32> = bf_results.iter().map(|(idx, _)| *idx as u32).collect();
 
     for nprobe in [1, 2, 5, 10, 20, 50] {
-        let ivf_results = topk(output_path, query, k, nprobe).await?;
+        let ivf_results = TopkBuilder::new(output_path, query)
+            .k(k)?
+            .nprobe(nprobe)?
+            .search()
+            .await?;
         let ivf_rows: Vec<u32> = ivf_results.iter().map(|r| r.row_idx).collect();
         let recall = ivf_rows.iter().filter(|r| bf_rows.contains(r)).count() as f64 / k as f64;
         println!("nprobe={:2}: recall@{}={:.2}", nprobe, k, recall);

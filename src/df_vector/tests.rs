@@ -11,7 +11,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 
 use super::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
-use crate::ivf::{IvfBuildParams, build_index};
+use crate::ivf::{EmbeddingColumn, IndexBuilder, IvfBuildParams};
 
 #[tokio::test]
 async fn vector_topk_end_to_end() -> datafusion::common::Result<()> {
@@ -48,12 +48,13 @@ async fn vector_topk_end_to_end() -> datafusion::common::Result<()> {
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 
-    build_index(
+    IndexBuilder::new(
         source_path.as_path(),
         indexed_path.as_path(),
-        "vec",
-        &IvfBuildParams::default(),
+        EmbeddingColumn::try_from("vec").unwrap(),
     )
+    .params(IvfBuildParams::default())
+    .build()
     .unwrap();
 
     let options = VectorTopKOptions {

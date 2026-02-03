@@ -18,22 +18,23 @@ Embed IVF (Inverted File) vector indexes directly into Parquet files for fast ap
 Convert an existing Parquet file with embeddings into an indexed file:
 
 ```rust
-use pq_vector::{build_index, IvfBuildParams};
+use pq_vector::{EmbeddingColumn, IndexBuilder, IvfBuildParams};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let params = IvfBuildParams {
-        n_clusters: Some(100),  // Number of IVF clusters (default: sqrt(n))
-        max_iters: 20,          // K-means iterations
+        n_clusters: Some(pq_vector::ClusterCount::new(100)?), // Number of IVF clusters
+        max_iters: 20,                                        // K-means iterations
         seed: 42,
     };
 
-    build_index(
-        Path::new("data/embeddings.parquet"),      // Source file
+    IndexBuilder::new(
+        Path::new("data/embeddings.parquet"),         // Source file
         Path::new("data/embeddings_indexed.parquet"), // Output file
-        "embedding",                                // Column name containing vectors
-        &params,
-    )?;
+        EmbeddingColumn::try_from("embedding")?,      // Column name containing vectors
+    )
+    .params(params)
+    .build()?;
 
     Ok(())
 }
@@ -44,17 +45,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Append an IVF index to an existing Parquet file without rewriting the data pages:
 
 ```rust
-use pq_vector::{build_index_inplace, IvfBuildParams};
+use pq_vector::{EmbeddingColumn, InplaceIndexBuilder, IvfBuildParams};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let params = IvfBuildParams::default();
 
-    build_index_inplace(
+    InplaceIndexBuilder::new(
         Path::new("data/embeddings.parquet"),
-        "embedding",
-        &params,
-    )?;
+        EmbeddingColumn::try_from("embedding")?,
+    )
+    .params(params)
+    .build()?;
 
     Ok(())
 }
@@ -63,19 +65,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 2. Search with Rust API
 
 ```rust
-use pq_vector::topk;
+use pq_vector::TopkBuilder;
 use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_vector: Vec<f32> = vec![/* your query embedding */];
 
-    let results = topk(
+    let results = TopkBuilder::new(
         Path::new("data/embeddings_indexed.parquet"),
         &query_vector,
-        10,    // k: number of results
-        5,     // nprobe: clusters to search (higher = more accurate, slower)
     )
+    .k(10)?
+    .nprobe(5)?
+    .search()
     .await?;
 
     for result in results {

@@ -1,6 +1,6 @@
 use arrow::array::{Array, Float32Array, ListArray, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pq_vector::{build_index, topk, IvfBuildParams};
+use pq_vector::{EmbeddingColumn, IndexBuilder, IvfBuildParams, TopkBuilder};
 use std::fs::File;
 use std::path::Path;
 
@@ -8,7 +8,7 @@ use std::path::Path;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_path = Path::new("data/vldb_2025.parquet");
     let output_path = Path::new("data/vldb_2025_indexed.parquet");
-    let embedding_column = "embedding";
+    let embedding_column = EmbeddingColumn::try_from("embedding")?;
 
     // Build the index and embed it in a new parquet file
     println!("=== Building IVF Index ===\n");
@@ -17,16 +17,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_iters: 10,
         seed: 42,
     };
-    build_index(source_path, output_path, embedding_column, &params)?;
+    IndexBuilder::new(source_path, output_path, embedding_column.clone())
+        .params(params)
+        .build()?;
 
     // Get a query vector (use the first embedding from the file)
-    let query = get_embedding_at_row(output_path, embedding_column, 0)?;
+    let query = get_embedding_at_row(output_path, embedding_column.as_str(), 0)?;
     println!("\n=== Searching for top 10 similar papers ===");
     println!("Query: first paper's embedding (should return itself as top result)\n");
 
     // Search with different nprobe values
     for nprobe in [1, 3, 5, 10] {
-        let results = topk(output_path, &query, 10, nprobe).await?;
+        let results = TopkBuilder::new(output_path, &query)
+            .k(10)?
+            .nprobe(nprobe)?
+            .search()
+            .await?;
         println!(
             "nprobe={}: top results: {:?}",
             nprobe,
@@ -40,7 +46,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Show detailed results
     println!("\n=== Detailed Results (nprobe=5) ===\n");
-    let results = topk(output_path, &query, 5, 5).await?;
+    let results = TopkBuilder::new(output_path, &query)
+        .k(5)?
+        .nprobe(5)?
+        .search()
+        .await?;
     let titles = get_titles(output_path)?;
 
     for (i, result) in results.iter().enumerate() {
@@ -56,8 +66,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test with a different query
     println!("=== Searching with row 100's embedding ===\n");
-    let query2 = get_embedding_at_row(output_path, embedding_column, 100)?;
-    let results = topk(output_path, &query2, 5, 5).await?;
+    let query2 = get_embedding_at_row(output_path, embedding_column.as_str(), 100)?;
+    let results = TopkBuilder::new(output_path, &query2)
+        .k(5)?
+        .nprobe(5)?
+        .search()
+        .await?;
 
     for (i, result) in results.iter().enumerate() {
         let title = &titles[result.row_idx as usize];
