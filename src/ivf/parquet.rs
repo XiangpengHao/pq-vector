@@ -40,17 +40,19 @@ impl IndexBuilder {
     pub fn n_clusters(
         mut self,
         n_clusters: usize,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        self.n_clusters = Some(ClusterCount::new(n_clusters)?);
-        Ok(self)
+    ) -> Self {
+        self.n_clusters = Some(ClusterCount::new(n_clusters).unwrap_or_else(|_| {
+            panic!("n_clusters must be > 0")
+        }));
+        self
     }
 
-    pub fn max_iters(mut self, max_iters: usize) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn max_iters(mut self, max_iters: usize) -> Self {
         if max_iters == 0 {
-            return Err("max_iters must be > 0".into());
+            panic!("max_iters must be > 0");
         }
         self.max_iters = max_iters;
-        Ok(self)
+        self
     }
 
     pub fn seed(mut self, seed: u64) -> Self {
