@@ -1,5 +1,7 @@
 # pq-vector
 
+[![CI](https://github.com/XiangpengHao/pq-vector/actions/workflows/ci.yml/badge.svg)](https://github.com/XiangpengHao/pq-vector/actions/workflows/ci.yml)
+
 Embed IVF (Inverted File) vector indexes directly into Parquet files for fast approximate nearest neighbor search.
 
 ## Features
