@@ -6,7 +6,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // For max-heap (we want to pop largest distances).
 #[derive(Debug, Clone)]
@@ -47,16 +47,16 @@ pub struct SearchResult {
 /// Builder for top-k nearest neighbor search.
 #[derive(Debug, Clone)]
 pub struct TopkBuilder<'a> {
-    parquet_path: &'a Path,
+    parquet_path: PathBuf,
     query: &'a [f32],
     k: Option<NonZeroUsize>,
     nprobe: Option<NonZeroUsize>,
 }
 
 impl<'a> TopkBuilder<'a> {
-    pub fn new(parquet_path: &'a Path, query: &'a [f32]) -> Self {
+    pub fn new(parquet_path: impl AsRef<Path>, query: &'a [f32]) -> Self {
         Self {
-            parquet_path,
+            parquet_path: parquet_path.as_ref().to_path_buf(),
             query,
             k: None,
             nprobe: None,
@@ -76,7 +76,7 @@ impl<'a> TopkBuilder<'a> {
     pub async fn search(self) -> Result<Vec<SearchResult>, Box<dyn std::error::Error>> {
         let k = self.k.ok_or("k must be set")?;
         let nprobe = self.nprobe.ok_or("nprobe must be set")?;
-        topk(self.parquet_path, self.query, k, nprobe).await
+        topk(self.parquet_path.as_path(), self.query, k, nprobe).await
     }
 }
 

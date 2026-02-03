@@ -11,18 +11,17 @@
 //!
 //! ```ignore
 //! use pq_vector::{
-//!     EmbeddingColumn,
 //!     IndexBuilder,
-//!     InplaceIndexBuilder,
-//!     IvfBuildParams,
 //!     TopkBuilder,
 //! };
 //! use std::path::Path;
 //!
 //! // Build index
-//! IndexBuilder::new(source, output, EmbeddingColumn::try_from("embedding")?)
-//!     .params(IvfBuildParams::default())
-//!     .build()?;
+//! IndexBuilder::new(source, "embedding")
+//!     .build_inplace()?;
+//! // Optional: write to a new file
+//! IndexBuilder::new(source, "embedding")
+//!     .build_new(output)?;
 //!
 //! // Query with Rust API
 //! let query_vector = vec![1.0f32, 2.0f32];
@@ -37,6 +36,5 @@ pub mod df_vector;
 pub mod ivf;
 
 pub use ivf::{
-    ClusterCount, EmbeddingColumn, IndexBuilder, InplaceIndexBuilder, IvfBuildParams, SearchResult,
-    TopkBuilder,
+    ClusterCount, IndexBuilder, SearchResult, TopkBuilder,
 };

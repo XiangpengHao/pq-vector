@@ -1,5 +1,5 @@
-use crate::ivf::index::build_ivf_index;
-use crate::ivf::{EmbeddingColumn, EmbeddingDim, Embeddings, IvfBuildParams, IvfIndex};
+use crate::ivf::index::{IvfBuildConfig, build_ivf_index};
+use crate::ivf::{ClusterCount, EmbeddingColumn, EmbeddingDim, Embeddings, IvfIndex};
 use arrow::array::{Array, Float32Array, ListArray, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use parquet::arrow::ArrowWriter;
@@ -14,78 +14,89 @@ use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Build an IVF index and embed it into a new parquet file.
 #[derive(Debug, Clone)]
-pub struct IndexBuilder<'a> {
-    source: &'a Path,
-    output: &'a Path,
-    embedding_column: EmbeddingColumn,
-    params: IvfBuildParams,
+pub struct IndexBuilder {
+    source: PathBuf,
+    embedding_column: String,
+    n_clusters: Option<ClusterCount>,
+    max_iters: usize,
+    seed: u64,
 }
 
-impl<'a> IndexBuilder<'a> {
-    pub fn new(source: &'a Path, output: &'a Path, embedding_column: EmbeddingColumn) -> Self {
+impl IndexBuilder {
+    pub fn new(source: impl AsRef<Path>, embedding_column: impl AsRef<str>) -> Self {
         Self {
-            source,
-            output,
-            embedding_column,
-            params: IvfBuildParams::default(),
+            source: source.as_ref().to_path_buf(),
+            embedding_column: embedding_column.as_ref().to_string(),
+            n_clusters: None,
+            max_iters: 20,
+            seed: 42,
         }
     }
 
-    pub fn params(mut self, params: IvfBuildParams) -> Self {
-        self.params = params;
+    pub fn n_clusters(
+        mut self,
+        n_clusters: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        self.n_clusters = Some(ClusterCount::new(n_clusters)?);
+        Ok(self)
+    }
+
+    pub fn max_iters(mut self, max_iters: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        if max_iters == 0 {
+            return Err("max_iters must be > 0".into());
+        }
+        self.max_iters = max_iters;
+        Ok(self)
+    }
+
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
         self
     }
 
-    pub fn build(self) -> Result<(), Box<dyn std::error::Error>> {
-        let parquet = read_parquet_with_embeddings(self.source, &self.embedding_column)?;
-        let index = build_ivf_index(&parquet.embeddings, &self.params)?;
+    pub fn build_inplace(self) -> Result<(), Box<dyn std::error::Error>> {
+        let embedding_column = EmbeddingColumn::try_from(self.embedding_column)?;
+        let parquet = read_parquet_with_embeddings(self.source.as_path(), &embedding_column)?;
+        let index = build_ivf_index(
+            &parquet.embeddings,
+            IvfBuildConfig {
+                n_clusters: self.n_clusters,
+                max_iters: self.max_iters,
+                seed: self.seed,
+            },
+        )?;
+        let plan = ParquetIndexAppend {
+            path: self.source.as_path(),
+            index: &index,
+            embedding_column: &embedding_column,
+        };
+        append_index_inplace(plan)?;
+        Ok(())
+    }
+
+    pub fn build_new(self, output: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+        let embedding_column = EmbeddingColumn::try_from(self.embedding_column)?;
+        let parquet = read_parquet_with_embeddings(self.source.as_path(), &embedding_column)?;
+        let index = build_ivf_index(
+            &parquet.embeddings,
+            IvfBuildConfig {
+                n_clusters: self.n_clusters,
+                max_iters: self.max_iters,
+                seed: self.seed,
+            },
+        )?;
         let plan = ParquetWritePlan {
-            path: self.output,
+            path: output.as_ref(),
             batches: &parquet.batches,
             schema: parquet.schema,
             index: &index,
-            embedding_column: &self.embedding_column,
+            embedding_column: &embedding_column,
         };
         write_parquet_with_index(plan)?;
-        Ok(())
-    }
-}
-
-/// Build an IVF index and append it to the same parquet file in-place.
-#[derive(Debug, Clone)]
-pub struct InplaceIndexBuilder<'a> {
-    parquet_path: &'a Path,
-    embedding_column: EmbeddingColumn,
-    params: IvfBuildParams,
-}
-
-impl<'a> InplaceIndexBuilder<'a> {
-    pub fn new(parquet_path: &'a Path, embedding_column: EmbeddingColumn) -> Self {
-        Self {
-            parquet_path,
-            embedding_column,
-            params: IvfBuildParams::default(),
-        }
-    }
-
-    pub fn params(mut self, params: IvfBuildParams) -> Self {
-        self.params = params;
-        self
-    }
-
-    pub fn build(self) -> Result<(), Box<dyn std::error::Error>> {
-        let parquet = read_parquet_with_embeddings(self.parquet_path, &self.embedding_column)?;
-        let index = build_ivf_index(&parquet.embeddings, &self.params)?;
-        let plan = ParquetIndexAppend {
-            path: self.parquet_path,
-            index: &index,
-            embedding_column: &self.embedding_column,
-        };
-        append_index_inplace(plan)?;
         Ok(())
     }
 }
@@ -353,7 +364,7 @@ fn append_index_inplace(plan: ParquetIndexAppend<'_>) -> Result<(), Box<dyn std:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ivf::{EmbeddingColumn, InplaceIndexBuilder, IvfBuildParams};
+    use crate::ivf::IndexBuilder;
     use arrow::array::types::Float32Type;
     use arrow::array::{Int32Array, ListArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -390,10 +401,7 @@ mod tests {
         writer.close().unwrap();
 
         let original_size = std::fs::metadata(&path).unwrap().len();
-        InplaceIndexBuilder::new(&path, EmbeddingColumn::try_from("vec").unwrap())
-            .params(IvfBuildParams::default())
-            .build()
-            .unwrap();
+        IndexBuilder::new(&path, "vec").build_inplace().unwrap();
         let new_size = std::fs::metadata(&path).unwrap().len();
         assert!(new_size > original_size);
 

@@ -5,7 +5,6 @@ expression: tree_str
 ┌───────────────────────────┐
 │       VectorTopKExec      │
 │    --------------------   │
-│      batch_size: 1024     │
 │     batches_fetched: 1    │
 │     candidate_rows: 6     │
 │        column: vec        │

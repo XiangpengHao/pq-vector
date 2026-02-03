@@ -7,23 +7,21 @@ use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use pq_vector::df_vector::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
-use pq_vector::{EmbeddingColumn, IndexBuilder, IvfBuildParams};
+use pq_vector::IndexBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_path = Path::new("data/vldb_2025.parquet");
     let indexed_path = Path::new("data/vldb_2025_indexed.parquet");
-    let embedding_column = EmbeddingColumn::try_from("embedding")?;
+    let embedding_column = "embedding";
 
     if !indexed_path.exists() {
-        IndexBuilder::new(source_path, indexed_path, embedding_column.clone())
-            .params(IvfBuildParams::default())
-            .build()?;
+        IndexBuilder::new(source_path, embedding_column)
+            .build_new(indexed_path)?;
     }
 
     let options = VectorTopKOptions {
         nprobe: 64,
-        batch_size: 1024,
         max_candidates: None,
     };
     let state = SessionStateBuilder::new()
@@ -39,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let query_vec = get_embedding_at_row(indexed_path, embedding_column.as_str(), 0)?;
+    let query_vec = get_embedding_at_row(indexed_path, embedding_column, 0)?;
     let query_literal = format!(
         "[{}]",
         query_vec

@@ -16,17 +16,21 @@ Vector Search with only Parquet and DataFusion
 ### 1) Build an index
 
 ```rust
-use pq_vector::{EmbeddingColumn, IndexBuilder, IvfBuildParams};
-use std::path::Path;
+use pq_vector::IndexBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     IndexBuilder::new(
-        Path::new("data/embeddings.parquet"),         // Source file
-        Path::new("data/embeddings_indexed.parquet"), // Output file
-        EmbeddingColumn::try_from("embedding")?,      // Column name containing vectors
+        "data/embeddings.parquet", // Source file (indexed in-place by default)
+        "embedding",               // Column name containing vectors
     )
-    .params(IvfBuildParams::default())
-    .build()?;
+    .n_clusters(100)?
+    .max_iters(20)?
+    .seed(42)
+    .build_inplace()?;
+
+    // Optional: write to a new file instead of in-place
+    IndexBuilder::new("data/embeddings.parquet", "embedding")
+        .build_new("data/embeddings_indexed.parquet")?;
 
     Ok(())
 }
@@ -36,16 +40,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use pq_vector::TopkBuilder;
-use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_vector: Vec<f32> = vec![/* your query embedding */];
 
-    let results = TopkBuilder::new(
-        Path::new("data/embeddings_indexed.parquet"),
-        &query_vector,
-    )
+    let results = TopkBuilder::new("data/embeddings_indexed.parquet", &query_vector)
     .k(10)?
     .nprobe(5)?
     .search()
@@ -62,28 +62,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 3) DataFusion SQL
 
 ```rust
-use std::path::Path;
 use std::sync::Arc;
 
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use pq_vector::df_vector::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
-use pq_vector::{EmbeddingColumn, IndexBuilder, IvfBuildParams};
+use pq_vector::IndexBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let source = Path::new("data/embeddings.parquet");
-    let indexed = Path::new("data/embeddings_indexed.parquet");
+    let source = "data/embeddings.parquet";
+    let indexed = "data/embeddings_indexed.parquet";
 
-    if !indexed.exists() {
-        IndexBuilder::new(source, indexed, EmbeddingColumn::try_from("embedding")?)
-            .params(IvfBuildParams::default())
-            .build()?;
+    if !std::path::Path::new(indexed).exists() {
+        IndexBuilder::new(source, "embedding")
+            .build_new(indexed)?;
     }
 
     let options = VectorTopKOptions {
         nprobe: 8,
-        batch_size: 1024,
         max_candidates: None,
     };
     let state = SessionStateBuilder::new()
@@ -92,33 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
     let ctx = SessionContext::new_with_state(state);
 
-    ctx.register_parquet("t", indexed.to_str().unwrap(), ParquetReadOptions::default())
+    ctx.register_parquet("t", indexed, ParquetReadOptions::default())
         .await?;
 
     let df = ctx
         .sql("SELECT id FROM t ORDER BY array_distance(embedding, [0.0, 0.0]) LIMIT 5")
         .await?;
     let _batches = df.collect().await?;
-    Ok(())
-}
-```
-
-## In-place indexing (optional)
-
-Append an IVF index to an existing Parquet file without rewriting data pages:
-
-```rust
-use pq_vector::{EmbeddingColumn, InplaceIndexBuilder, IvfBuildParams};
-use std::path::Path;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    InplaceIndexBuilder::new(
-        Path::new("data/embeddings.parquet"),
-        EmbeddingColumn::try_from("embedding")?,
-    )
-    .params(IvfBuildParams::default())
-    .build()?;
-
     Ok(())
 }
 ```

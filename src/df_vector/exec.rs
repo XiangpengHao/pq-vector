@@ -161,9 +161,10 @@ impl VectorTopKExec {
         let max_candidates = self.options.max_candidates.unwrap_or(usize::MAX);
         let mut heap = BinaryHeap::new();
         let mut scanned = 0usize;
+        let batch_size = context.session_config().batch_size();
 
         while heap.len() < self.k && scanned < max_candidates {
-            let batch = cursor.next_batch(self.options.batch_size);
+            let batch = cursor.next_batch(batch_size);
             if batch.is_empty() {
                 break;
             }
@@ -217,7 +218,6 @@ impl DisplayAs for VectorTopKExec {
                 writeln!(f, "column={}", self.vector_column)?;
                 writeln!(f, "query_dim={}", self.query.len())?;
                 writeln!(f, "nprobe={}", self.options.nprobe)?;
-                writeln!(f, "batch_size={}", self.options.batch_size)?;
                 if let Some(max_candidates) = self.options.max_candidates {
                     writeln!(f, "max_candidates={max_candidates}")?;
                 }

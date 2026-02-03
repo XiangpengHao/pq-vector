@@ -1,6 +1,6 @@
 use arrow::array::{Array, Float32Array, ListArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pq_vector::{EmbeddingColumn, IndexBuilder, IvfBuildParams, TopkBuilder};
+use pq_vector::{IndexBuilder, TopkBuilder};
 use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::time::Instant;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compressed_path = Path::new("data/combined_lz4.parquet");
     let indexed_path = Path::new("data/combined_indexed.parquet");
-    let embedding_column = EmbeddingColumn::try_from("embedding")?;
+    let embedding_column = "embedding";
 
     let compressed_size = fs::metadata(compressed_path)?.len();
     println!(
@@ -21,14 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 1: Build the index
     println!("\n=== Building IVF Index ===");
     let start = Instant::now();
-    let params = IvfBuildParams {
-        n_clusters: None, // sqrt(n) ~ 70 clusters
-        max_iters: 20,
-        seed: 42,
-    };
-    IndexBuilder::new(compressed_path, indexed_path, embedding_column.clone())
-        .params(params)
-        .build()?;
+    IndexBuilder::new(compressed_path, embedding_column)
+        .max_iters(20)?
+        .seed(42)
+        .build_new(indexed_path)?;
     let build_time = start.elapsed();
     println!("Build time: {:.2}s", build_time.as_secs_f64());
 
@@ -44,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Load all embeddings for brute force and recall calculation
-    let (all_embeddings, dim) = read_all_embeddings(indexed_path, embedding_column.as_str())?;
+    let (all_embeddings, dim) = read_all_embeddings(indexed_path, embedding_column)?;
     let n_vectors = all_embeddings.len() / dim;
     println!("\nDataset: {} vectors, dim={}", n_vectors, dim);
 
@@ -60,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..iterations {
         for &qr in &query_rows {
             // Read all embeddings from parquet file (this is what brute force must do)
-            let (embs, d) = read_all_embeddings(compressed_path, embedding_column.as_str())?;
+            let (embs, d) = read_all_embeddings(compressed_path, embedding_column)?;
             let query = &embs[qr * d..(qr + 1) * d];
             let _ = brute_force_topk(&embs, d, query, k);
         }

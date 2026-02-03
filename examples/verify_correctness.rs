@@ -9,7 +9,7 @@
 
 use arrow::array::{Array, Float32Array, ListArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pq_vector::{ClusterCount, EmbeddingColumn, IndexBuilder, IvfBuildParams, TopkBuilder};
+use pq_vector::{IndexBuilder, TopkBuilder};
 use std::cmp::Ordering;
 use std::fs::File;
 use std::path::Path;
@@ -18,22 +18,18 @@ use std::path::Path;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_path = Path::new("data/vldb_2025.parquet");
     let output_path = Path::new("data/vldb_2025_indexed.parquet");
-    let embedding_column = EmbeddingColumn::try_from("embedding")?;
+    let embedding_column = "embedding";
 
     // Build the index with more clusters for a realistic test
     // With sqrt(496)≈22 clusters, most neighbors end up in the same cluster
     // Use 50 clusters to show the recall/nprobe tradeoff
-    let params = IvfBuildParams {
-        n_clusters: Some(ClusterCount::new(50)?),
-        max_iters: 20,
-        ..Default::default()
-    };
-    IndexBuilder::new(source_path, output_path, embedding_column.clone())
-        .params(params)
-        .build()?;
+    IndexBuilder::new(source_path, embedding_column)
+        .n_clusters(50)?
+        .max_iters(20)?
+        .build_new(output_path)?;
 
     // Load all embeddings for brute force comparison
-    let (embeddings, dim) = read_embeddings(output_path, embedding_column.as_str())?;
+    let (embeddings, dim) = read_embeddings(output_path, embedding_column)?;
     let n_vectors = embeddings.len() / dim;
 
     // Test multiple queries

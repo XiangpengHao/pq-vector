@@ -1,6 +1,6 @@
 use arrow::array::{Array, Float32Array, ListArray, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pq_vector::{EmbeddingColumn, IndexBuilder, IvfBuildParams, TopkBuilder};
+use pq_vector::{IndexBuilder, TopkBuilder};
 use std::fs::File;
 use std::path::Path;
 
@@ -8,21 +8,17 @@ use std::path::Path;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_path = Path::new("data/vldb_2025.parquet");
     let output_path = Path::new("data/vldb_2025_indexed.parquet");
-    let embedding_column = EmbeddingColumn::try_from("embedding")?;
+    let embedding_column = "embedding";
 
     // Build the index and embed it in a new parquet file
     println!("=== Building IVF Index ===\n");
-    let params = IvfBuildParams {
-        n_clusters: None, // Use sqrt(n)
-        max_iters: 10,
-        seed: 42,
-    };
-    IndexBuilder::new(source_path, output_path, embedding_column.clone())
-        .params(params)
-        .build()?;
+    IndexBuilder::new(source_path, embedding_column)
+        .max_iters(10)?
+        .seed(42)
+        .build_new(output_path)?;
 
     // Get a query vector (use the first embedding from the file)
-    let query = get_embedding_at_row(output_path, embedding_column.as_str(), 0)?;
+    let query = get_embedding_at_row(output_path, embedding_column, 0)?;
     println!("\n=== Searching for top 10 similar papers ===");
     println!("Query: first paper's embedding (should return itself as top result)\n");
 
@@ -66,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test with a different query
     println!("=== Searching with row 100's embedding ===\n");
-    let query2 = get_embedding_at_row(output_path, embedding_column.as_str(), 100)?;
+    let query2 = get_embedding_at_row(output_path, embedding_column, 100)?;
     let results = TopkBuilder::new(output_path, &query2)
         .k(5)?
         .nprobe(5)?

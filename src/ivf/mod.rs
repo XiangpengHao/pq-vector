@@ -10,13 +10,13 @@ mod search;
 
 use std::num::NonZeroU32;
 
-pub use index::{ClusterCount, IvfBuildParams};
-pub use parquet::{IndexBuilder, InplaceIndexBuilder};
+pub use index::ClusterCount;
+pub use parquet::IndexBuilder;
 pub use search::{SearchResult, TopkBuilder};
 
 /// Non-empty embedding column name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddingColumn(String);
+pub(crate) struct EmbeddingColumn(String);
 
 impl EmbeddingColumn {
     pub fn new(name: impl Into<String>) -> Result<Self, Box<dyn std::error::Error>> {

@@ -41,25 +41,11 @@ impl TryFrom<usize> for ClusterCount {
     }
 }
 
-/// Parameters for building an IVF index.
-#[derive(Debug, Clone)]
-pub struct IvfBuildParams {
-    /// Number of clusters. If None, uses sqrt(n).
-    pub n_clusters: Option<ClusterCount>,
-    /// Max iterations for k-means
-    pub max_iters: usize,
-    /// Random seed
-    pub seed: u64,
-}
-
-impl Default for IvfBuildParams {
-    fn default() -> Self {
-        Self {
-            n_clusters: None,
-            max_iters: 20,
-            seed: 42,
-        }
-    }
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IvfBuildConfig {
+    pub(crate) n_clusters: Option<ClusterCount>,
+    pub(crate) max_iters: usize,
+    pub(crate) seed: u64,
 }
 
 impl IvfIndex {
@@ -164,14 +150,14 @@ impl IvfIndex {
 
 pub(crate) fn build_ivf_index(
     embeddings: &Embeddings,
-    params: &IvfBuildParams,
+    config: IvfBuildConfig,
 ) -> Result<IvfIndex, Box<dyn std::error::Error>> {
     let n_vectors = embeddings.row_count();
     if n_vectors == 0 {
         return Err("Cannot build IVF index with zero vectors".into());
     }
 
-    let n_clusters = match params.n_clusters {
+    let n_clusters = match config.n_clusters {
         Some(value) => value,
         None => {
             let target = (n_vectors as f64).sqrt().ceil() as usize;
@@ -181,8 +167,8 @@ pub(crate) fn build_ivf_index(
 
     let kmeans_params = KMeansParams {
         n_clusters,
-        max_iters: params.max_iters,
-        seed: params.seed,
+        max_iters: config.max_iters,
+        seed: config.seed,
     };
 
     let (centroids, assignments) = kmeans(embeddings, kmeans_params);
