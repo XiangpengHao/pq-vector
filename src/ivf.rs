@@ -9,16 +9,19 @@ use arrow::datatypes::SchemaRef;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
-use parquet::file::metadata::KeyValue;
+use parquet::file::metadata::{
+    FileMetaData, FooterTail, KeyValue, ParquetMetaDataBuilder, ParquetMetaDataWriter,
+};
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
+use parquet::file::FOOTER_SIZE;
 use rand::Rng;
 use rand::SeedableRng;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// Magic bytes to identify our IVF index format
@@ -210,6 +213,32 @@ pub fn build_index(
     let (batches, schema, embeddings, dim) =
         read_parquet_with_embeddings(source_path, embedding_column)?;
 
+    let index = build_ivf_index(&embeddings, dim, params);
+
+    // Write output parquet with embedded index
+    write_parquet_with_index(output_path, &batches, schema, &index, embedding_column)?;
+
+    Ok(())
+}
+
+/// Build an IVF index and append it to the same parquet file in-place.
+///
+/// This reads the parquet file, builds an IVF index on the specified
+/// embedding column, appends the index after the existing footer metadata,
+/// and writes a new footer metadata block at the end of the file.
+pub fn build_index_inplace(
+    parquet_path: &Path,
+    embedding_column: &str,
+    params: &IvfBuildParams,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_batches, _schema, embeddings, dim) =
+        read_parquet_with_embeddings(parquet_path, embedding_column)?;
+    let index = build_ivf_index(&embeddings, dim, params);
+    append_index_inplace(parquet_path, &index, embedding_column)?;
+    Ok(())
+}
+
+fn build_ivf_index(embeddings: &[f32], dim: usize, params: &IvfBuildParams) -> IvfIndex {
     let n_vectors = embeddings.len() / dim;
     let n_clusters = params
         .n_clusters
@@ -217,7 +246,7 @@ pub fn build_index(
 
     // Run k-means clustering
     let (centroids, assignments) =
-        kmeans(&embeddings, dim, n_clusters, params.max_iters, params.seed);
+        kmeans(embeddings, dim, n_clusters, params.max_iters, params.seed);
 
     // Build inverted lists
     let mut inverted_lists = vec![Vec::new(); n_clusters];
@@ -225,17 +254,12 @@ pub fn build_index(
         inverted_lists[cluster_idx].push(row_idx as u32);
     }
 
-    let index = IvfIndex {
+    IvfIndex {
         dim,
         n_clusters,
         centroids,
         inverted_lists,
-    };
-
-    // Write output parquet with embedded index
-    write_parquet_with_index(output_path, &batches, schema, &index, embedding_column)?;
-
-    Ok(())
+    }
 }
 
 /// Search for top-k nearest neighbors in a parquet file with embedded IVF index.
@@ -428,6 +452,82 @@ fn write_parquet_with_index(
     ));
 
     writer.close()?;
+
+    Ok(())
+}
+
+/// Append IVF index to an existing parquet file by rewriting the footer.
+fn append_index_inplace(
+    path: &Path,
+    index: &IvfIndex,
+    embedding_column: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let reader = SerializedFileReader::new(File::open(path)?)?;
+    let metadata = reader.metadata().clone();
+
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len < FOOTER_SIZE as u64 {
+        return Err("Parquet file too small to contain a footer".into());
+    }
+
+    file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+    let mut footer_bytes = [0u8; FOOTER_SIZE];
+    file.read_exact(&mut footer_bytes)?;
+    let footer_tail = FooterTail::try_new(&footer_bytes)?;
+    if footer_tail.is_encrypted_footer() {
+        return Err("Encrypted parquet footers are not supported for in-place indexing".into());
+    }
+
+    let metadata_len = footer_tail.metadata_length() as u64;
+    if metadata_len + FOOTER_SIZE as u64 > file_len {
+        return Err("Parquet footer length exceeds file size".into());
+    }
+
+    let metadata_end = file_len - FOOTER_SIZE as u64;
+    let index_offset = metadata_end;
+
+    let mut key_values = metadata
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default();
+    key_values.retain(|kv| {
+        kv.key != IVF_INDEX_OFFSET_KEY && kv.key != IVF_EMBEDDING_COLUMN_KEY
+    });
+    key_values.push(KeyValue::new(
+        IVF_INDEX_OFFSET_KEY.to_string(),
+        index_offset.to_string(),
+    ));
+    key_values.push(KeyValue::new(
+        IVF_EMBEDDING_COLUMN_KEY.to_string(),
+        embedding_column.to_string(),
+    ));
+
+    let file_metadata = FileMetaData::new(
+        metadata.file_metadata().version(),
+        metadata.file_metadata().num_rows(),
+        metadata.file_metadata().created_by().map(str::to_string),
+        Some(key_values),
+        metadata.file_metadata().schema_descr_ptr(),
+        metadata.file_metadata().column_orders().cloned(),
+    );
+
+    let new_metadata = ParquetMetaDataBuilder::new(file_metadata)
+        .set_row_groups(metadata.row_groups().to_vec())
+        .build();
+
+    file.seek(SeekFrom::Start(metadata_end))?;
+
+    let index_bytes = index.to_bytes();
+    let index_len = index_bytes.len() as u64;
+    file.write_all(IVF_INDEX_MAGIC)?;
+    file.write_all(&index_len.to_le_bytes())?;
+    file.write_all(&index_bytes)?;
+
+    let writer = ParquetMetaDataWriter::new(&mut file, &new_metadata);
+    writer.finish()?;
+    file.flush()?;
 
     Ok(())
 }
@@ -699,6 +799,11 @@ fn kmeans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::types::Float32Type;
+    use arrow::array::{Int32Array, ListArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
     #[test]
     fn test_squared_l2_distance() {
@@ -724,5 +829,48 @@ mod tests {
         assert_eq!(restored.n_clusters, index.n_clusters);
         assert_eq!(restored.centroids, index.centroids);
         assert_eq!(restored.inverted_lists, index.inverted_lists);
+    }
+
+    #[test]
+    fn test_build_index_inplace_appends_footer() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("data.parquet");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vec",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                false,
+            ),
+        ]));
+
+        let ids = Int32Array::from(vec![0, 1, 2]);
+        let vectors = vec![
+            Some(vec![Some(0.0), Some(0.0)]),
+            Some(vec![Some(1.0), Some(0.0)]),
+            Some(vec![Some(0.0), Some(2.0)]),
+        ];
+        let vec_array = ListArray::from_iter_primitive::<Float32Type, _, _>(vectors);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(vec_array)],
+        )
+        .unwrap();
+
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let original_size = std::fs::metadata(&path).unwrap().len();
+        build_index_inplace(&path, "vec", &IvfBuildParams::default()).unwrap();
+        let new_size = std::fs::metadata(&path).unwrap().len();
+        assert!(new_size > original_size);
+
+        let (index, embedding_column) = read_index_from_parquet(&path).unwrap();
+        assert_eq!(embedding_column, "vec");
+        assert_eq!(index.dim, 2);
+        assert_eq!(index.n_clusters, index.inverted_lists.len());
     }
 }

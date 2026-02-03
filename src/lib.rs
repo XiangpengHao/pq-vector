@@ -24,4 +24,4 @@
 pub mod df_vector;
 pub mod ivf;
 
-pub use ivf::{IvfBuildParams, SearchResult, build_index, topk};
+pub use ivf::{IvfBuildParams, SearchResult, build_index, build_index_inplace, topk};
