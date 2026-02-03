@@ -5,9 +5,11 @@ mod exec;
 mod expr;
 mod options;
 mod physical;
+mod session;
 
 #[cfg(test)]
 mod tests;
 
 pub use options::VectorTopKOptions;
 pub use physical::VectorTopKPhysicalOptimizerRule;
+pub use session::{PqVectorSessionBuilderExt, PqVectorSessionConfigExt};

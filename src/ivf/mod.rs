@@ -102,4 +102,4 @@ impl Embeddings {
 }
 
 pub(crate) use index::IvfIndex;
-pub(crate) use parquet::read_index_from_parquet;
+pub(crate) use parquet::{read_index_from_parquet, read_index_metadata};

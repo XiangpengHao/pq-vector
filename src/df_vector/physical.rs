@@ -12,6 +12,9 @@ use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
+use crate::ivf::read_index_metadata;
+
+use super::access::{gather_single_parquet_scan, local_path_from_object_store};
 use super::exec::VectorTopKExec;
 use super::expr::scalar_to_f32_list;
 use super::options::VectorTopKOptions;
@@ -145,6 +148,9 @@ impl VectorTopKPhysicalOptimizerRule {
         let Some((column, query_vector)) = extract_array_distance_physical(&sort_expr.expr) else {
             return Ok(None);
         };
+        if !self.vector_index_available(sort.input(), &column)? {
+            return Ok(None);
+        }
         let k = match limit_fetch {
             Some(limit) => sort.fetch().map(|f| f.min(limit)).unwrap_or(limit),
             None => {
@@ -161,6 +167,39 @@ impl VectorTopKPhysicalOptimizerRule {
             k,
             self.options.clone(),
         ))))
+    }
+
+    fn vector_index_available(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        vector_column: &str,
+    ) -> Result<bool> {
+        let Some(scan) = gather_single_parquet_scan(plan)? else {
+            return Ok(false);
+        };
+        let mut file_count = 0usize;
+        for file_group in scan.file_groups.iter() {
+            for file in file_group.files().iter() {
+                file_count += 1;
+                let local_path =
+                    match local_path_from_object_store(&scan.object_store_url, file.path().as_ref())
+                    {
+                        Some(path) => path,
+                        None => return Ok(false),
+                    };
+                let embedding = match read_index_metadata(&local_path) {
+                    Ok(metadata) => metadata,
+                    Err(_) => return Ok(false),
+                };
+                let Some(embedding) = embedding else {
+                    return Ok(false);
+                };
+                if embedding.as_str() != vector_column {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(file_count > 0)
     }
 }
 

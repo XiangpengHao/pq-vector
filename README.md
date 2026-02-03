@@ -62,22 +62,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 3) DataFusion SQL
 
 ```rust
-use std::sync::Arc;
-
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
-use pq_vector::df_vector::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
+use pq_vector::df_vector::{PqVectorSessionBuilderExt, VectorTopKOptions};
 use pq_vector::IndexBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let source = "data/embeddings.parquet";
     let indexed = "data/embeddings_indexed.parquet";
-
-    if !std::path::Path::new(indexed).exists() {
-        IndexBuilder::new(source, "embedding")
-            .build_new(indexed)?;
-    }
 
     let options = VectorTopKOptions {
         nprobe: 8,
@@ -85,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state = SessionStateBuilder::new()
         .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(VectorTopKPhysicalOptimizerRule::new(options)))
+        .with_pq_vector(options)
         .build();
     let ctx = SessionContext::new_with_state(state);
 
@@ -98,6 +90,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _batches = df.collect().await?;
     Ok(())
 }
+```
+
+If you already have a custom `SessionConfig`, enable pq-vector like this:
+
+```rust
+use datafusion::execution::SessionStateBuilder;
+use datafusion::prelude::SessionConfig;
+use pq_vector::df_vector::{PqVectorSessionBuilderExt, PqVectorSessionConfigExt, VectorTopKOptions};
+
+let options = VectorTopKOptions {
+    nprobe: 8,
+    max_candidates: None,
+};
+let config = SessionConfig::new()
+    .with_target_partitions(2)
+    .with_pq_vector();
+let state = SessionStateBuilder::new()
+    .with_default_features()
+    .with_pq_vector(options)
+    .with_config(config)
+    .build();
 ```
 
 ## Notes

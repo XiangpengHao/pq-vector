@@ -111,27 +111,57 @@ const IVF_INDEX_OFFSET_KEY: &str = "ivf_index_offset";
 /// Metadata key for the embedding column name.
 const IVF_EMBEDDING_COLUMN_KEY: &str = "ivf_embedding_column";
 
+#[derive(Debug, Clone)]
+struct IndexMetadata {
+    offset: u64,
+    embedding_column: EmbeddingColumn,
+}
+
+fn parse_index_metadata(
+    metadata: &FileMetaData,
+) -> Result<Option<IndexMetadata>, Box<dyn std::error::Error>> {
+    let Some(kv) = metadata.key_value_metadata() else {
+        return Ok(None);
+    };
+    let offset = kv
+        .iter()
+        .find(|k| k.key == IVF_INDEX_OFFSET_KEY)
+        .and_then(|k| k.value.clone());
+    let embedding = kv
+        .iter()
+        .find(|k| k.key == IVF_EMBEDDING_COLUMN_KEY)
+        .and_then(|k| k.value.clone());
+    let (Some(offset), Some(embedding)) = (offset, embedding) else {
+        return Ok(None);
+    };
+    let offset: u64 = offset.parse()?;
+    let embedding_column = EmbeddingColumn::try_from(embedding)?;
+    Ok(Some(IndexMetadata {
+        offset,
+        embedding_column,
+    }))
+}
+
+pub(crate) fn read_index_metadata(
+    path: &Path,
+) -> Result<Option<EmbeddingColumn>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let metadata = reader.metadata().file_metadata();
+    let metadata = parse_index_metadata(metadata)?;
+    Ok(metadata.map(|meta| meta.embedding_column))
+}
+
 pub(crate) fn read_index_from_parquet(
     path: &Path,
 ) -> Result<(IvfIndex, EmbeddingColumn), Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let reader = SerializedFileReader::new(file.try_clone()?)?;
     let metadata = reader.metadata().file_metadata();
-
-    let offset_str = metadata
-        .key_value_metadata()
-        .and_then(|kv| kv.iter().find(|k| k.key == IVF_INDEX_OFFSET_KEY))
-        .and_then(|k| k.value.clone())
-        .ok_or("Missing IVF index offset in metadata")?;
-
-    let offset: u64 = offset_str.parse()?;
-
-    let embedding_column = metadata
-        .key_value_metadata()
-        .and_then(|kv| kv.iter().find(|k| k.key == IVF_EMBEDDING_COLUMN_KEY))
-        .and_then(|k| k.value.clone())
-        .ok_or("Missing embedding column name in metadata")?;
-    let embedding_column = EmbeddingColumn::try_from(embedding_column)?;
+    let metadata =
+        parse_index_metadata(metadata)?.ok_or("Missing IVF index metadata in parquet footer")?;
+    let offset = metadata.offset;
+    let embedding_column = metadata.embedding_column;
 
     let mut file = file;
     file.seek(SeekFrom::Start(offset))?;

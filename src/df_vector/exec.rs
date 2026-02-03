@@ -79,6 +79,21 @@ impl VectorTopKExec {
         context: Arc<TaskContext>,
         metrics: &VectorTopKMetricHandles,
     ) -> Result<RecordBatch> {
+        let scan_info = gather_single_parquet_scan(&self.scan_plan)?
+            .ok_or_else(|| {
+                DataFusionError::Plan(
+                    "VectorTopKExec requires a single parquet scan input".to_string(),
+                )
+            })?;
+        self.execute_with_index(&scan_info, context, metrics).await
+    }
+
+    async fn execute_with_index(
+        &self,
+        scan: &ParquetScanInfo,
+        context: Arc<TaskContext>,
+        metrics: &VectorTopKMetricHandles,
+    ) -> Result<RecordBatch> {
         let schema = self.scan_plan.schema();
         let vector_idx = schema.index_of(&self.vector_column).map_err(|_| {
             DataFusionError::Plan(format!(
@@ -87,28 +102,6 @@ impl VectorTopKExec {
             ))
         })?;
 
-        let scan_info = gather_single_parquet_scan(&self.scan_plan).unwrap_or_default();
-
-        if let Some(scan_info) = scan_info
-            && let Some(result) = self
-                .try_execute_with_index(&scan_info, vector_idx, context.clone(), metrics)
-                .await?
-        {
-            return Ok(result);
-        }
-
-        let batches = collect(self.scan_plan.clone(), context).await?;
-        let topk = compute_topk_from_batches(&batches, vector_idx, &self.query, self.k, metrics)?;
-        build_batch_from_rows(schema, topk)
-    }
-
-    async fn try_execute_with_index(
-        &self,
-        scan: &ParquetScanInfo,
-        vector_idx: usize,
-        context: Arc<TaskContext>,
-        metrics: &VectorTopKMetricHandles,
-    ) -> Result<Option<RecordBatch>> {
         let mut file_entries = Vec::new();
         let mut candidate_rows = 0usize;
         for file_group in scan.file_groups.iter() {
@@ -121,12 +114,20 @@ impl VectorTopKExec {
                                 "VectorTopK only supports local file:// paths".to_string(),
                             )
                         })?;
-                let (index, embedding_column) = match read_index_from_parquet(&local_path) {
-                    Ok(index) => index,
-                    Err(_) => return Ok(None),
-                };
+                let (index, embedding_column) =
+                    read_index_from_parquet(&local_path).map_err(|err| {
+                        DataFusionError::Plan(format!(
+                            "Failed to read IVF index from {}: {}",
+                            local_path.display(),
+                            err
+                        ))
+                    })?;
                 if embedding_column.as_str() != self.vector_column {
-                    return Ok(None);
+                    return Err(DataFusionError::Plan(format!(
+                        "IVF index column mismatch: expected '{}', found '{}'",
+                        self.vector_column,
+                        embedding_column.as_str()
+                    )));
                 }
                 if index.dim() != self.query.len() {
                     return Err(DataFusionError::Plan(format!(
@@ -147,7 +148,9 @@ impl VectorTopKExec {
         }
 
         if file_entries.is_empty() {
-            return Ok(None);
+            return Err(DataFusionError::Plan(
+                "VectorTopKExec requires at least one indexed parquet file".to_string(),
+            ));
         }
 
         metrics.index_used.add(1);
@@ -196,7 +199,7 @@ impl VectorTopKExec {
 
         let rows = results.into_iter().map(|r| r.values).collect::<Vec<_>>();
         let schema = self.scan_plan.schema();
-        Ok(Some(build_batch_from_rows(schema, rows)?))
+        build_batch_from_rows(schema, rows)
     }
 }
 
@@ -367,26 +370,6 @@ impl Ord for TopKRow {
             .partial_cmp(&other.distance)
             .unwrap_or(Ordering::Equal)
     }
-}
-
-fn compute_topk_from_batches(
-    batches: &[RecordBatch],
-    vector_idx: usize,
-    query: &[f32],
-    k: usize,
-    metrics: &VectorTopKMetricHandles,
-) -> Result<Vec<Vec<ScalarValue>>> {
-    let mut heap = BinaryHeap::new();
-    for batch in batches {
-        update_topk_heap(&mut heap, batch, vector_idx, query, k, metrics)?;
-    }
-    let mut rows: Vec<TopKRow> = heap.into_iter().collect();
-    rows.sort_by(|a, b| {
-        a.distance
-            .partial_cmp(&b.distance)
-            .unwrap_or(Ordering::Equal)
-    });
-    Ok(rows.into_iter().map(|r| r.values).collect())
 }
 
 fn update_topk_heap(
