@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/XiangpengHao/pq-vector/actions/workflows/ci.yml/badge.svg)](https://github.com/XiangpengHao/pq-vector/actions/workflows/ci.yml)
 
-Embed IVF (Inverted File) vector indexes directly into Parquet files for fast approximate nearest neighbor search.
+Vector Search with only Parquet and DataFusion
 
 ## Features
 
@@ -11,58 +11,28 @@ Embed IVF (Inverted File) vector indexes directly into Parquet files for fast ap
 - **DataFusion integration**: Ergonomic vector search with just SQL.
 - **Zero-copy**: Zero-copy, in-place Parquet indexing.
 
-## Quick Start
+## Quick start
 
-### 1. Build an Index
-
-Convert an existing Parquet file with embeddings into an indexed file:
+### 1) Build an index
 
 ```rust
 use pq_vector::{EmbeddingColumn, IndexBuilder, IvfBuildParams};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let params = IvfBuildParams {
-        n_clusters: Some(pq_vector::ClusterCount::new(100)?), // Number of IVF clusters
-        max_iters: 20,                                        // K-means iterations
-        seed: 42,
-    };
-
     IndexBuilder::new(
         Path::new("data/embeddings.parquet"),         // Source file
         Path::new("data/embeddings_indexed.parquet"), // Output file
         EmbeddingColumn::try_from("embedding")?,      // Column name containing vectors
     )
-    .params(params)
+    .params(IvfBuildParams::default())
     .build()?;
 
     Ok(())
 }
 ```
 
-### 1b. Build an Index In-Place
-
-Append an IVF index to an existing Parquet file without rewriting the data pages:
-
-```rust
-use pq_vector::{EmbeddingColumn, InplaceIndexBuilder, IvfBuildParams};
-use std::path::Path;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let params = IvfBuildParams::default();
-
-    InplaceIndexBuilder::new(
-        Path::new("data/embeddings.parquet"),
-        EmbeddingColumn::try_from("embedding")?,
-    )
-    .params(params)
-    .build()?;
-
-    Ok(())
-}
-```
-
-### 2. Search with Rust API
+### 2) Search with Rust
 
 ```rust
 use pq_vector::TopkBuilder;
@@ -89,56 +59,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Result Columns
+### 3) DataFusion SQL
 
-The Rust API returns row indices and distances:
+```rust
+use std::path::Path;
+use std::sync::Arc;
 
-| Column     | Type  | Description                   |
-| ---------- | ----- | ----------------------------- |
-| `row_idx`  | usize | Row index in the Parquet file |
-| `distance` | f32   | L2 distance from query vector |
+use datafusion::execution::SessionStateBuilder;
+use datafusion::prelude::{ParquetReadOptions, SessionContext};
+use pq_vector::df_vector::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
+use pq_vector::{EmbeddingColumn, IndexBuilder, IvfBuildParams};
 
-## How It Works
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let source = Path::new("data/embeddings.parquet");
+    let indexed = Path::new("data/embeddings_indexed.parquet");
 
-1. **Index Building**: K-means clustering creates IVF centroids, vectors are assigned to clusters
-2. **Storage**: Index bytes (centroids + inverted lists) appended after Parquet data pages, offset stored in footer metadata
-3. **Search**: Query finds nearest centroids, searches only those clusters, returns top-k by distance
+    if !indexed.exists() {
+        IndexBuilder::new(source, indexed, EmbeddingColumn::try_from("embedding")?)
+            .params(IvfBuildParams::default())
+            .build()?;
+    }
 
-## Parameters
+    let options = VectorTopKOptions {
+        nprobe: 8,
+        batch_size: 1024,
+        max_candidates: None,
+    };
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(VectorTopKPhysicalOptimizerRule::new(options)))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
 
-### `IvfBuildParams`
+    ctx.register_parquet("t", indexed.to_str().unwrap(), ParquetReadOptions::default())
+        .await?;
 
-| Parameter    | Default   | Description                     |
-| ------------ | --------- | ------------------------------- |
-| `n_clusters` | `sqrt(n)` | Number of IVF clusters          |
-| `max_iters`  | 20        | K-means iterations              |
-| `seed`       | 42        | Random seed for reproducibility |
-
-### Search Parameters
-
-| Parameter | Recommendation | Description                                                 |
-| --------- | -------------- | ----------------------------------------------------------- |
-| `k`       | -              | Number of results needed                                    |
-| `nprobe`  | 5-20           | More = better recall, slower. Start with `sqrt(n_clusters)` |
-
-## Recall vs Speed
-
-With 50 clusters on 496 vectors:
-
-| nprobe | Recall@10 | Clusters Searched |
-| ------ | --------- | ----------------- |
-| 1      | ~49%      | 2%                |
-| 5      | ~87%      | 10%               |
-| 10     | ~95%      | 20%               |
-| 50     | 100%      | 100%              |
-
-## Requirements
-
-```toml
-[dependencies]
-pq-vector = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+    let df = ctx
+        .sql("SELECT id FROM t ORDER BY array_distance(embedding, [0.0, 0.0]) LIMIT 5")
+        .await?;
+    let _batches = df.collect().await?;
+    Ok(())
+}
 ```
+
+## In-place indexing (optional)
+
+Append an IVF index to an existing Parquet file without rewriting data pages:
+
+```rust
+use pq_vector::{EmbeddingColumn, InplaceIndexBuilder, IvfBuildParams};
+use std::path::Path;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    InplaceIndexBuilder::new(
+        Path::new("data/embeddings.parquet"),
+        EmbeddingColumn::try_from("embedding")?,
+    )
+    .params(IvfBuildParams::default())
+    .build()?;
+
+    Ok(())
+}
+```
+
+## Notes
+
+- `k` controls how many results you return.
+- `nprobe` trades speed for recall (higher = more accurate, slower).
 
 ## License
 
