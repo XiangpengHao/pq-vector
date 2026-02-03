@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Building IVF Index ===");
     let start = Instant::now();
     IndexBuilder::new(compressed_path, embedding_column)
-        .max_iters(20)?
+        .max_iters(20)
         .seed(42)
         .build_new(indexed_path)?;
     let build_time = start.elapsed();

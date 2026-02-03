@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the index and embed it in a new parquet file
     println!("=== Building IVF Index ===\n");
     IndexBuilder::new(source_path, embedding_column)
-        .max_iters(10)?
+        .max_iters(10)
         .seed(42)
         .build_new(output_path)?;
 

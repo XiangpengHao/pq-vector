@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 pub struct IndexBuilder {
     source: PathBuf,
     embedding_column: String,
-    n_clusters: Option<ClusterCount>,
+    n_clusters: Option<usize>,
     max_iters: usize,
     seed: u64,
 }
@@ -41,16 +41,11 @@ impl IndexBuilder {
         mut self,
         n_clusters: usize,
     ) -> Self {
-        self.n_clusters = Some(ClusterCount::new(n_clusters).unwrap_or_else(|_| {
-            panic!("n_clusters must be > 0")
-        }));
+        self.n_clusters = Some(n_clusters);
         self
     }
 
     pub fn max_iters(mut self, max_iters: usize) -> Self {
-        if max_iters == 0 {
-            panic!("max_iters must be > 0");
-        }
         self.max_iters = max_iters;
         self
     }
@@ -61,16 +56,10 @@ impl IndexBuilder {
     }
 
     pub fn build_inplace(self) -> Result<(), Box<dyn std::error::Error>> {
+        let config = self.build_config()?;
         let embedding_column = EmbeddingColumn::try_from(self.embedding_column)?;
         let parquet = read_parquet_with_embeddings(self.source.as_path(), &embedding_column)?;
-        let index = build_ivf_index(
-            &parquet.embeddings,
-            IvfBuildConfig {
-                n_clusters: self.n_clusters,
-                max_iters: self.max_iters,
-                seed: self.seed,
-            },
-        )?;
+        let index = build_ivf_index(&parquet.embeddings, config)?;
         let plan = ParquetIndexAppend {
             path: self.source.as_path(),
             index: &index,
@@ -81,16 +70,10 @@ impl IndexBuilder {
     }
 
     pub fn build_new(self, output: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+        let config = self.build_config()?;
         let embedding_column = EmbeddingColumn::try_from(self.embedding_column)?;
         let parquet = read_parquet_with_embeddings(self.source.as_path(), &embedding_column)?;
-        let index = build_ivf_index(
-            &parquet.embeddings,
-            IvfBuildConfig {
-                n_clusters: self.n_clusters,
-                max_iters: self.max_iters,
-                seed: self.seed,
-            },
-        )?;
+        let index = build_ivf_index(&parquet.embeddings, config)?;
         let plan = ParquetWritePlan {
             path: output.as_ref(),
             batches: &parquet.batches,
@@ -100,6 +83,22 @@ impl IndexBuilder {
         };
         write_parquet_with_index(plan)?;
         Ok(())
+    }
+
+    fn build_config(&self) -> Result<IvfBuildConfig, Box<dyn std::error::Error>> {
+        if self.max_iters == 0 {
+            return Err("max_iters must be > 0".into());
+        }
+        let n_clusters = match self.n_clusters {
+            Some(0) => return Err("n_clusters must be > 0".into()),
+            Some(value) => Some(ClusterCount::new(value)?),
+            None => None,
+        };
+        Ok(IvfBuildConfig {
+            n_clusters,
+            max_iters: self.max_iters,
+            seed: self.seed,
+        })
     }
 }
 

@@ -24,8 +24,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // With sqrt(496)≈22 clusters, most neighbors end up in the same cluster
     // Use 50 clusters to show the recall/nprobe tradeoff
     IndexBuilder::new(source_path, embedding_column)
-        .n_clusters(50)?
-        .max_iters(20)?
+        .n_clusters(50)
+        .max_iters(20)
         .build_new(output_path)?;
 
     // Load all embeddings for brute force comparison

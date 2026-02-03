@@ -23,8 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "data/embeddings.parquet", // Source file (indexed in-place by default)
         "embedding",               // Column name containing vectors
     )
-    .n_clusters(100)?
-    .max_iters(20)?
+    .n_clusters(100)
+    .max_iters(20)
     .seed(42)
     .build_inplace()?;
 
