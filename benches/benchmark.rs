@@ -1,200 +1,174 @@
-use arrow::array::{Array, Float32Array, ListArray};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pq_vector::{IndexBuilder, TopkBuilder};
-use std::cmp::Ordering;
-use std::fs::{self, File};
+use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
+
+use arrow::array::{Float32Builder, Int32Builder, ListBuilder};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::prelude::{ParquetReadOptions, SessionContext};
+use parquet::arrow::ArrowWriter;
+use pq_vector::IndexBuilder;
+use pq_vector::df_vector::{VectorTopKOptions, VectorTopKPhysicalOptimizerRule};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
+const ROWS: usize = 1_000_000;
+const DIM: usize = 1024;
+const BATCH_ROWS: usize = 2048;
+const K: usize = 100;
+const NPROBE: usize = 8;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let compressed_path = Path::new("data/combined_lz4.parquet");
-    let indexed_path = Path::new("data/combined_indexed.parquet");
-    let embedding_column = "embedding";
+    let data_dir = Path::new("data");
+    fs::create_dir_all(data_dir)?;
 
-    let compressed_size = fs::metadata(compressed_path)?.len();
-    println!(
-        "Compressed file size: {:.2} MB",
-        compressed_size as f64 / 1024.0 / 1024.0
-    );
+    let parquet_path = data_dir.join("benchmark.parquet");
+    if parquet_path.exists() {
+        fs::remove_file(&parquet_path)?;
+    }
 
-    // Step 1: Build the index
-    println!("\n=== Building IVF Index ===");
-    let start = Instant::now();
-    IndexBuilder::new(compressed_path, embedding_column)
-        .max_iters(20)
-        .seed(42)
-        .build_new(indexed_path)?;
-    let build_time = start.elapsed();
-    println!("Build time: {:.2}s", build_time.as_secs_f64());
+    println!("=== Generating synthetic dataset ===");
+    println!("rows={ROWS}, dim={DIM}, batch_rows={BATCH_ROWS}");
 
-    let indexed_size = fs::metadata(indexed_path)?.len();
-    println!(
-        "Indexed file size: {:.2} MB",
-        indexed_size as f64 / 1024.0 / 1024.0
-    );
+    let gen_start = Instant::now();
+    generate_parquet(&parquet_path, ROWS, DIM, BATCH_ROWS)?;
+    let gen_time = gen_start.elapsed();
+
+    let original_size = fs::metadata(&parquet_path)?.len();
+    println!("Generated parquet in {:.2?}", gen_time);
+    println!("Original parquet size: {:.2} MB", to_mb(original_size));
+
+    println!("\n=== Vector search without index (DataFusion) ===");
+    let query = random_query(DIM, 7);
+    let query_literal = array_literal(&query);
+    let sql =
+        format!("SELECT id FROM t ORDER BY array_distance(embedding, {query_literal}) LIMIT {K}");
+
+    let plain_ctx = SessionContext::new();
+    plain_ctx
+        .register_parquet(
+            "t",
+            parquet_path.to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+    let plain_start = Instant::now();
+    let plain_batches = plain_ctx.sql(&sql).await?.collect().await?;
+    let plain_time = plain_start.elapsed();
+    let plain_rows: usize = plain_batches.iter().map(|b| b.num_rows()).sum();
+    println!("Query time (no index): {:.2?}", plain_time);
+    println!("Returned rows: {plain_rows}");
+
+    println!("\n=== Building IVF index (in-place, defaults) ===");
+    let index_start = Instant::now();
+    IndexBuilder::new(&parquet_path, "embedding").build_inplace()?;
+    let index_time = index_start.elapsed();
+
+    let indexed_size = fs::metadata(&parquet_path)?.len();
+    println!("Index build time: {:.2?}", index_time);
+    println!("Indexed parquet size: {:.2} MB", to_mb(indexed_size));
     println!(
         "Index overhead: {:.2} MB ({:.1}%)",
-        (indexed_size - compressed_size) as f64 / 1024.0 / 1024.0,
-        (indexed_size - compressed_size) as f64 / compressed_size as f64 * 100.0
+        to_mb(indexed_size - original_size),
+        (indexed_size - original_size) as f64 / original_size as f64 * 100.0
     );
 
-    // Load all embeddings for brute force and recall calculation
-    let (all_embeddings, dim) = read_all_embeddings(indexed_path, embedding_column)?;
-    let n_vectors = all_embeddings.len() / dim;
-    println!("\nDataset: {} vectors, dim={}", n_vectors, dim);
+    println!("\n=== Vector search with index (DataFusion) ===");
+    let options = VectorTopKOptions {
+        nprobe: NPROBE,
+        max_candidates: None,
+    };
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(VectorTopKPhysicalOptimizerRule::new(options)))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
 
-    // Use multiple query vectors for more reliable measurements
-    let query_rows = vec![42, 100, 500, 1000, 2000, 3000, 4000];
-    let k = 10;
-
-    // Step 2: Benchmark brute force - reading ALL embeddings from parquet each time
-    // This is the fair comparison: IVF reads some pages, brute force reads all pages
-    println!("\n=== Brute Force Performance (reading from parquet) ===");
-    let start = Instant::now();
-    let iterations = 5;
-    for _ in 0..iterations {
-        for &qr in &query_rows {
-            // Read all embeddings from parquet file (this is what brute force must do)
-            let (embs, d) = read_all_embeddings(compressed_path, embedding_column)?;
-            let query = &embs[qr * d..(qr + 1) * d];
-            let _ = brute_force_topk(&embs, d, query, k);
-        }
-    }
-    let bf_time = start.elapsed().as_secs_f64() / (iterations * query_rows.len()) as f64;
-    println!(
-        "Brute force (with I/O): {:.2}ms per query",
-        bf_time * 1000.0
-    );
-
-    // Also show in-memory brute force for reference
-    println!("\n=== In-Memory Brute Force (for reference) ===");
-    let start = Instant::now();
-    let iterations = 50;
-    for _ in 0..iterations {
-        for &qr in &query_rows {
-            let query = &all_embeddings[qr * dim..(qr + 1) * dim];
-            let _ = brute_force_topk(&all_embeddings, dim, query, k);
-        }
-    }
-    let bf_mem_time = start.elapsed().as_secs_f64() / (iterations * query_rows.len()) as f64;
-    println!(
-        "Brute force (in-memory): {:.2}ms per query",
-        bf_mem_time * 1000.0
-    );
-
-    // Step 3: Benchmark IVF with different nprobe values + measure recall
-    println!("\n=== IVF Performance & Recall ===");
-    println!(
-        "{:>8} {:>12} {:>10} {:>10}",
-        "nprobe", "time (ms)", "speedup", "recall@10"
-    );
-    println!("{}", "-".repeat(44));
-
-    for nprobe in [1, 2, 5, 10, 20, 40, 70] {
-        // Measure time
-        let start = Instant::now();
-        let iterations = 20;
-        for _ in 0..iterations {
-            for &qr in &query_rows {
-                let query = &all_embeddings[qr * dim..(qr + 1) * dim];
-                let _ = TopkBuilder::new(indexed_path, query)
-                    .k(k)?
-                    .nprobe(nprobe)?
-                    .search()
-                    .await?;
-            }
-        }
-        let ivf_time = start.elapsed().as_secs_f64() / (iterations * query_rows.len()) as f64;
-
-        // Measure recall
-        let mut total_recall = 0.0;
-        for &qr in &query_rows {
-            let query = &all_embeddings[qr * dim..(qr + 1) * dim];
-
-            // Ground truth from brute force
-            let bf_results = brute_force_topk(&all_embeddings, dim, query, k);
-            let bf_set: std::collections::HashSet<usize> =
-                bf_results.iter().map(|(idx, _)| *idx).collect();
-
-            // IVF results
-            let ivf_results = TopkBuilder::new(indexed_path, query)
-                .k(k)?
-                .nprobe(nprobe)?
-                .search()
-                .await?;
-            let ivf_set: std::collections::HashSet<usize> =
-                ivf_results.iter().map(|r| r.row_idx as usize).collect();
-
-            let overlap = bf_set.intersection(&ivf_set).count();
-            total_recall += overlap as f64 / k as f64;
-        }
-        let avg_recall = total_recall / query_rows.len() as f64;
-
-        let speedup = bf_time / ivf_time;
-        println!(
-            "{:>8} {:>12.2} {:>10.1}x {:>10.2}",
-            nprobe,
-            ivf_time * 1000.0,
-            speedup,
-            avg_recall
-        );
-    }
+    ctx.register_parquet(
+        "t",
+        parquet_path.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+    let indexed_start = Instant::now();
+    let indexed_batches = ctx.sql(&sql).await?.collect().await?;
+    let indexed_time = indexed_start.elapsed();
+    let indexed_rows: usize = indexed_batches.iter().map(|b| b.num_rows()).sum();
+    println!("Query time (with index): {:.2?}", indexed_time);
+    println!("Returned rows: {indexed_rows}");
 
     Ok(())
 }
 
-fn read_all_embeddings(
+fn generate_parquet(
     path: &Path,
-    column_name: &str,
-) -> Result<(Vec<f32>, usize), Box<dyn std::error::Error>> {
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
+    rows: usize,
+    dim: usize,
+    batch_rows: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "embedding",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            false,
+        ),
+    ]));
 
-    let mut all_embeddings = Vec::new();
-    let mut dim = 0;
+    let file = fs::File::create(path)?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+    let mut rng = StdRng::seed_from_u64(1234);
 
-    for batch in reader {
-        let batch = batch?;
-        let embedding_col = batch.column_by_name(column_name).unwrap();
-        let list_array = embedding_col.as_any().downcast_ref::<ListArray>().unwrap();
-        let values = list_array.values();
-        let float_array = values.as_any().downcast_ref::<Float32Array>().unwrap();
+    let mut row = 0usize;
+    while row < rows {
+        let count = (rows - row).min(batch_rows);
+        let mut id_builder = Int32Builder::with_capacity(count);
+        let mut list_builder = ListBuilder::new(Float32Builder::with_capacity(count * dim));
 
-        if dim == 0 && list_array.len() > 0 {
-            dim = float_array.len() / list_array.len();
+        for i in 0..count {
+            id_builder.append_value((row + i) as i32);
+            for _ in 0..dim {
+                list_builder.values().append_value(rng.r#gen::<f32>());
+            }
+            list_builder.append(true);
         }
 
-        for i in 0..float_array.len() {
-            all_embeddings.push(float_array.value(i));
-        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(id_builder.finish()),
+                Arc::new(list_builder.finish()),
+            ],
+        )?;
+        writer.write(&batch)?;
+        row += count;
     }
 
-    Ok((all_embeddings, dim))
+    writer.close()?;
+    Ok(())
 }
 
-fn brute_force_topk(data: &[f32], dim: usize, query: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let n = data.len() / dim;
-    let mut distances: Vec<(usize, f32)> = (0..n)
-        .map(|i| {
-            let vec = &data[i * dim..(i + 1) * dim];
-            let dist = squared_l2_distance(query, vec).sqrt();
-            (i, dist)
-        })
-        .collect();
-
-    distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    distances.truncate(k);
-    distances
+fn random_query(dim: usize, seed: u64) -> Vec<f32> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..dim).map(|_| rng.r#gen::<f32>()).collect()
 }
 
-fn squared_l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let diff = x - y;
-            diff * diff
-        })
-        .sum()
+fn array_literal(values: &[f32]) -> String {
+    let mut out = String::with_capacity(values.len() * 10);
+    out.push('[');
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&value.to_string());
+    }
+    out.push(']');
+    out
+}
+
+fn to_mb(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0
 }

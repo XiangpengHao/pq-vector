@@ -32,7 +32,7 @@ impl IndexBuilder {
             source: source.as_ref().to_path_buf(),
             embedding_column: embedding_column.as_ref().to_string(),
             n_clusters: None,
-            max_iters: 20,
+            max_iters: 7,
             seed: 42,
         }
     }

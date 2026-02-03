@@ -164,6 +164,13 @@ pub(crate) fn build_ivf_index(
             ClusterCount::new(target)?
         }
     };
+    if n_clusters.as_usize() > n_vectors {
+        return Err("n_clusters cannot exceed number of vectors".into());
+    }
+
+    let mut sample_size = (n_vectors / 20).max(1); // 5%
+    sample_size = sample_size.min(100_000);
+    sample_size = sample_size.max(n_clusters.as_usize()).min(n_vectors);
 
     let kmeans_params = KMeansParams {
         n_clusters,
@@ -171,10 +178,19 @@ pub(crate) fn build_ivf_index(
         seed: config.seed,
     };
 
-    let (centroids, assignments) = kmeans(embeddings, kmeans_params);
+    let (centroids, _) = if sample_size == n_vectors {
+        kmeans(embeddings, kmeans_params)
+    } else {
+        let sample = sample_embeddings(embeddings, sample_size, config.seed)?;
+        kmeans(&sample, kmeans_params)
+    };
 
     let mut inverted_lists = vec![Vec::new(); n_clusters.as_usize()];
-    for (row_idx, &cluster_idx) in assignments.iter().enumerate() {
+    let dim = embeddings.dim().as_usize();
+    let data = embeddings.data();
+    for row_idx in 0..n_vectors {
+        let vec = &data[row_idx * dim..(row_idx + 1) * dim];
+        let cluster_idx = nearest_centroid(vec, &centroids, dim);
         inverted_lists[cluster_idx].push(row_idx as u32);
     }
 
@@ -190,6 +206,43 @@ struct KMeansParams {
     n_clusters: ClusterCount,
     max_iters: usize,
     seed: u64,
+}
+
+fn sample_embeddings(
+    embeddings: &Embeddings,
+    sample_size: usize,
+    seed: u64,
+) -> Result<Embeddings, Box<dyn std::error::Error>> {
+    use rand::seq::index::sample;
+
+    let n = embeddings.row_count();
+    let dim = embeddings.dim().as_usize();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let indices = sample(&mut rng, n, sample_size);
+
+    let mut data = Vec::with_capacity(sample_size * dim);
+    for idx in indices.iter() {
+        let start = idx * dim;
+        let end = start + dim;
+        data.extend_from_slice(&embeddings.data()[start..end]);
+    }
+
+    Embeddings::new(data, embeddings.dim())
+}
+
+fn nearest_centroid(vec: &[f32], centroids: &[f32], dim: usize) -> usize {
+    let mut best_cluster = 0usize;
+    let mut best_dist = f32::INFINITY;
+    let n_clusters = centroids.len() / dim;
+    for i in 0..n_clusters {
+        let start = i * dim;
+        let dist = squared_l2_distance(vec, &centroids[start..start + dim]);
+        if dist < best_dist {
+            best_dist = dist;
+            best_cluster = i;
+        }
+    }
+    best_cluster
 }
 
 /// K-means clustering implementation with k-means++ initialization.
