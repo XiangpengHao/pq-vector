@@ -87,18 +87,14 @@ impl VectorTopKExec {
             ))
         })?;
 
-        let scan_info = match gather_single_parquet_scan(&self.scan_plan) {
-            Ok(info) => info,
-            Err(_) => None,
-        };
+        let scan_info = gather_single_parquet_scan(&self.scan_plan).unwrap_or_default();
 
-        if let Some(scan_info) = scan_info {
-            if let Some(result) = self
+        if let Some(scan_info) = scan_info
+            && let Some(result) = self
                 .try_execute_with_index(&scan_info, vector_idx, context.clone(), metrics)
                 .await?
-            {
-                return Ok(result);
-            }
+        {
+            return Ok(result);
         }
 
         let batches = collect(self.scan_plan.clone(), context).await?;
@@ -412,11 +408,11 @@ fn update_topk_heap(
         let item = TopKRow { distance, values };
         if heap.len() < k {
             heap.push(item);
-        } else if let Some(top) = heap.peek() {
-            if distance < top.distance {
-                heap.pop();
-                heap.push(item);
-            }
+        } else if let Some(top) = heap.peek()
+            && distance < top.distance
+        {
+            heap.pop();
+            heap.push(item);
         }
     }
     Ok(())
@@ -466,8 +462,8 @@ fn compute_distance_values(values: &ArrayRef, query: &[f32]) -> Result<Option<f3
             return Ok(None);
         }
         let mut dist = 0.0f32;
-        for i in 0..floats.len() {
-            let diff = floats.value(i) - query[i];
+        for (&value, &q) in floats.values().iter().zip(query) {
+            let diff = value - q;
             dist += diff * diff;
         }
         return Ok(Some(dist));
@@ -477,8 +473,8 @@ fn compute_distance_values(values: &ArrayRef, query: &[f32]) -> Result<Option<f3
             return Ok(None);
         }
         let mut dist = 0.0f32;
-        for i in 0..floats.len() {
-            let diff = floats.value(i) as f32 - query[i];
+        for (&value, &q) in floats.values().iter().zip(query) {
+            let diff = value as f32 - q;
             dist += diff * diff;
         }
         return Ok(Some(dist));

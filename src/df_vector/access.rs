@@ -42,13 +42,13 @@ fn collect_parquet_scans(
     plan: &Arc<dyn ExecutionPlan>,
     scans: &mut Vec<ParquetScanInfo>,
 ) -> Result<()> {
-    if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
-        if let Some((file_scan, _source)) = exec.downcast_to_file_source::<ParquetSource>() {
-            scans.push(ParquetScanInfo {
-                file_groups: file_scan.file_groups.clone(),
-                object_store_url: file_scan.object_store_url.clone(),
-            });
-        }
+    if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+        && let Some((file_scan, _source)) = exec.downcast_to_file_source::<ParquetSource>()
+    {
+        scans.push(ParquetScanInfo {
+            file_groups: file_scan.file_groups.clone(),
+            object_store_url: file_scan.object_store_url.clone(),
+        });
     }
 
     for child in plan.children() {
@@ -61,28 +61,28 @@ pub(crate) fn rewrite_with_access_plans(
     plan: Arc<dyn ExecutionPlan>,
     access_plans: &HashMap<String, ParquetAccessPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
-        if let Some((file_scan, _source)) = exec.downcast_to_file_source::<ParquetSource>() {
-            let mut new_config = file_scan.clone();
-            let mut new_groups = Vec::with_capacity(new_config.file_groups.len());
-            for group in &new_config.file_groups {
-                let mut new_files = Vec::with_capacity(group.len());
-                for file in group.files() {
-                    let key = file.path().as_ref().to_string();
-                    let plan = access_plans.get(&key);
-                    let new_file = if let Some(plan) = plan {
-                        file.clone().with_extensions(Arc::new(plan.clone()))
-                    } else {
-                        file.clone()
-                    };
-                    new_files.push(new_file);
-                }
-                new_groups.push(FileGroup::new(new_files));
+    if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+        && let Some((file_scan, _source)) = exec.downcast_to_file_source::<ParquetSource>()
+    {
+        let mut new_config = file_scan.clone();
+        let mut new_groups = Vec::with_capacity(new_config.file_groups.len());
+        for group in &new_config.file_groups {
+            let mut new_files = Vec::with_capacity(group.len());
+            for file in group.files() {
+                let key = file.path().as_ref().to_string();
+                let plan = access_plans.get(&key);
+                let new_file = if let Some(plan) = plan {
+                    file.clone().with_extensions(Arc::new(plan.clone()))
+                } else {
+                    file.clone()
+                };
+                new_files.push(new_file);
             }
-            new_config.file_groups = new_groups;
-            let new_exec = DataSourceExec::new(Arc::new(new_config));
-            return Ok(Arc::new(new_exec));
+            new_groups.push(FileGroup::new(new_files));
         }
+        new_config.file_groups = new_groups;
+        let new_exec = DataSourceExec::new(Arc::new(new_config));
+        return Ok(Arc::new(new_exec));
     }
 
     let mut new_children = Vec::with_capacity(plan.children().len());

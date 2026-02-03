@@ -82,7 +82,7 @@ impl Embeddings {
         dim: EmbeddingDim,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let dim_usize = dim.as_usize();
-        if data.len() % dim_usize != 0 {
+        if !data.len().is_multiple_of(dim_usize) {
             return Err("Embedding data length must be a multiple of dimension".into());
         }
         Ok(Self { data, dim })

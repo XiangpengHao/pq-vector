@@ -118,11 +118,11 @@ async fn topk(
 
         if heap.len() < k {
             heap.push(HeapItem { row_idx, distance });
-        } else if let Some(top) = heap.peek() {
-            if distance < top.distance {
-                heap.pop();
-                heap.push(HeapItem { row_idx, distance });
-            }
+        } else if let Some(top) = heap.peek()
+            && distance < top.distance
+        {
+            heap.pop();
+            heap.push(HeapItem { row_idx, distance });
         }
     }
 

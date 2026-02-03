@@ -34,18 +34,15 @@ impl VectorTopKPhysicalOptimizerRule {
         has_offset: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if let Some(merge) = plan.as_any().downcast_ref::<SortPreservingMergeExec>() {
-            if !has_offset {
-                if let Some(sort) = merge.input().as_any().downcast_ref::<SortExec>() {
-                    if merge.expr().len() == sort.expr().len()
-                        && merge.expr().len() == 1
-                        && merge.expr()[0] == sort.expr()[0]
-                        && sort.preserve_partitioning()
-                    {
-                        if let Some(topk) = self.build_topk_from_sort_merge(sort, merge.fetch())? {
-                            return Ok(topk);
-                        }
-                    }
-                }
+            if !has_offset
+                && let Some(sort) = merge.input().as_any().downcast_ref::<SortExec>()
+                && merge.expr().len() == sort.expr().len()
+                && merge.expr().len() == 1
+                && merge.expr()[0] == sort.expr()[0]
+                && sort.preserve_partitioning()
+                && let Some(topk) = self.build_topk_from_sort_merge(sort, merge.fetch())?
+            {
+                return Ok(topk);
             }
             let child = self.rewrite_plan(merge.input().clone(), has_offset)?;
             if Arc::ptr_eq(&child, merge.input()) {
@@ -56,12 +53,11 @@ impl VectorTopKPhysicalOptimizerRule {
 
         if let Some(limit) = plan.as_any().downcast_ref::<GlobalLimitExec>() {
             let skip = limit.skip();
-            if skip == 0 {
-                if let Some(sort) = limit.input().as_any().downcast_ref::<SortExec>() {
-                    if let Some(topk) = self.build_topk_from_sort(sort, limit.fetch())? {
-                        return Ok(topk);
-                    }
-                }
+            if skip == 0
+                && let Some(sort) = limit.input().as_any().downcast_ref::<SortExec>()
+                && let Some(topk) = self.build_topk_from_sort(sort, limit.fetch())?
+            {
+                return Ok(topk);
             }
             let child = self.rewrite_plan(limit.input().clone(), has_offset || skip > 0)?;
             if Arc::ptr_eq(&child, limit.input()) {
@@ -71,10 +67,10 @@ impl VectorTopKPhysicalOptimizerRule {
         }
 
         if let Some(limit) = plan.as_any().downcast_ref::<LocalLimitExec>() {
-            if let Some(sort) = limit.input().as_any().downcast_ref::<SortExec>() {
-                if let Some(topk) = self.build_topk_from_sort(sort, Some(limit.fetch()))? {
-                    return Ok(topk);
-                }
+            if let Some(sort) = limit.input().as_any().downcast_ref::<SortExec>()
+                && let Some(topk) = self.build_topk_from_sort(sort, Some(limit.fetch()))?
+            {
+                return Ok(topk);
             }
             let child = self.rewrite_plan(limit.input().clone(), has_offset)?;
             if Arc::ptr_eq(&child, limit.input()) {
@@ -83,12 +79,11 @@ impl VectorTopKPhysicalOptimizerRule {
             return plan.with_new_children(vec![child]);
         }
 
-        if let Some(sort) = plan.as_any().downcast_ref::<SortExec>() {
-            if !has_offset {
-                if let Some(topk) = self.build_topk_from_sort(sort, None)? {
-                    return Ok(topk);
-                }
-            }
+        if let Some(sort) = plan.as_any().downcast_ref::<SortExec>()
+            && !has_offset
+            && let Some(topk) = self.build_topk_from_sort(sort, None)?
+        {
+            return Ok(topk);
         }
 
         self.rewrite_children(plan, has_offset)
