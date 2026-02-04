@@ -2,16 +2,18 @@ use crate::ivf::index::{IvfBuildConfig, build_ivf_index};
 use crate::ivf::{ClusterCount, EmbeddingColumn, EmbeddingDim, Embeddings, IvfIndex};
 use arrow::array::{Array, Float32Array, Float64Array, ListArray, RecordBatch};
 use arrow::datatypes::SchemaRef;
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowSchemaConverter, ArrowWriter};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::Compression;
+use parquet::basic::{Compression, Encoding, PageType};
 use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{
-    FileMetaData, FooterTail, KeyValue, ParquetMetaDataBuilder, ParquetMetaDataWriter,
+    ColumnChunkMetaData, FileMetaData, FooterTail, KeyValue, ParquetMetaDataBuilder,
+    ParquetMetaDataWriter,
 };
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -72,6 +74,7 @@ impl IndexBuilder {
         let parquet = read_parquet_with_embeddings(self.source.as_path(), &embedding_column)?;
         let index = build_ivf_index(&parquet.embeddings, config)?;
         let plan = ParquetWritePlan {
+            source: self.source.as_path(),
             path: output.as_ref(),
             batches: &parquet.batches,
             schema: parquet.schema,
@@ -284,6 +287,7 @@ fn read_parquet_with_embeddings(
 }
 
 struct ParquetWritePlan<'a> {
+    source: &'a Path,
     path: &'a Path,
     batches: &'a [RecordBatch],
     schema: SchemaRef,
@@ -294,19 +298,31 @@ struct ParquetWritePlan<'a> {
 fn write_parquet_with_index(plan: ParquetWritePlan<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let vector_size = plan.index.dim() * std::mem::size_of::<f32>();
 
-    let embedding_col_path = parquet::schema::types::ColumnPath::new(vec![
-        plan.embedding_column.as_str().to_string(),
-        "list".to_string(),
-        "element".to_string(),
-    ]);
+    let parquet_schema = ArrowSchemaConverter::new().convert(plan.schema.as_ref())?;
+    let output_columns = parquet_schema.columns();
+    let embedding_col_path = embedding_column_path(output_columns, plan.embedding_column)?;
+    let column_options = collect_column_write_options(plan.source, output_columns.len())?;
 
-    println!("embedding_col_path: {:?}", embedding_col_path);
-    let props = WriterProperties::builder()
+    let mut props = WriterProperties::builder()
         .set_data_page_size_limit(vector_size)
-        .set_column_compression(embedding_col_path.clone(), Compression::UNCOMPRESSED)
+        .set_data_page_row_count_limit(1);
+
+    for (column, options) in output_columns.iter().zip(column_options.iter()) {
+        let path = column.path().clone();
+        props = props
+            .set_column_compression(path.clone(), options.compression)
+            .set_column_dictionary_enabled(path.clone(), options.dictionary_enabled);
+
+        if let Some(encoding) = options.encoding {
+            props = props.set_column_encoding(path.clone(), encoding);
+        }
+
+        props = props.set_column_statistics_enabled(path.clone(), options.statistics_enabled);
+    }
+
+    let props = props
         .set_column_dictionary_enabled(embedding_col_path.clone(), false)
         .set_column_statistics_enabled(embedding_col_path.clone(), EnabledStatistics::Chunk)
-        .set_column_encoding(embedding_col_path.clone(), parquet::basic::Encoding::PLAIN)
         .set_column_write_page_header_statistics(embedding_col_path, false)
         .build();
 
@@ -340,6 +356,161 @@ fn write_parquet_with_index(plan: ParquetWritePlan<'_>) -> Result<(), Box<dyn st
     writer.close()?;
 
     Ok(())
+}
+
+fn embedding_column_path(
+    columns: &[parquet::schema::types::ColumnDescPtr],
+    embedding_column: &EmbeddingColumn,
+) -> Result<parquet::schema::types::ColumnPath, Box<dyn std::error::Error>> {
+    let mut matches = columns
+        .iter()
+        .filter(|col| {
+            col.path()
+                .parts()
+                .first()
+                .is_some_and(|root| root == embedding_column.as_str())
+        })
+        .map(|col| col.path().clone())
+        .collect::<Vec<_>>();
+
+    match matches.len() {
+        1 => Ok(matches.swap_remove(0)),
+        0 => Err(format!(
+            "Embedding column '{}' not found in parquet schema",
+            embedding_column.as_str()
+        )
+        .into()),
+        _ => Err(format!(
+            "Embedding column '{}' maps to multiple parquet leaf columns",
+            embedding_column.as_str()
+        )
+        .into()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ColumnWriteOptions {
+    compression: Compression,
+    dictionary_enabled: bool,
+    encoding: Option<Encoding>,
+    statistics_enabled: EnabledStatistics,
+}
+
+fn collect_column_write_options(
+    source: &Path,
+    expected_columns: usize,
+) -> Result<Vec<ColumnWriteOptions>, Box<dyn std::error::Error>> {
+    let reader = SerializedFileReader::new(File::open(source)?)?;
+    let metadata = reader.metadata();
+    let row_groups = metadata.row_groups();
+    if row_groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let first_columns = row_groups[0].columns();
+    if first_columns.len() != expected_columns {
+        return Err(format!(
+            "Expected {expected_columns} columns in source parquet, found {}",
+            first_columns.len()
+        )
+        .into());
+    }
+
+    let mut options = Vec::with_capacity(first_columns.len());
+    for column in first_columns {
+        options.push(column_write_options(column));
+    }
+
+    for (row_group_idx, row_group) in row_groups.iter().enumerate().skip(1) {
+        let columns = row_group.columns();
+        if columns.len() != expected_columns {
+            return Err(format!(
+                "Row group {row_group_idx} column count mismatch: expected {expected_columns}, found {}",
+                columns.len()
+            )
+            .into());
+        }
+
+        for (col_idx, column) in columns.iter().enumerate() {
+            let current = column_write_options(column);
+            if current != options[col_idx] {
+                return Err(format!(
+                    "Column settings for leaf column {col_idx} differ between row groups"
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(options)
+}
+
+fn column_write_options(column: &ColumnChunkMetaData) -> ColumnWriteOptions {
+    ColumnWriteOptions {
+        compression: column.compression(),
+        dictionary_enabled: column_uses_dictionary(column),
+        encoding: data_page_encoding(column),
+        statistics_enabled: column_statistics_level(column),
+    }
+}
+
+fn column_uses_dictionary(column: &ColumnChunkMetaData) -> bool {
+    column.dictionary_page_offset().is_some()
+        || column.encodings().any(|encoding| is_dictionary_encoding(encoding))
+}
+
+fn column_statistics_level(column: &ColumnChunkMetaData) -> EnabledStatistics {
+    if column.column_index_offset().is_some() {
+        EnabledStatistics::Page
+    } else if column.statistics().is_some() {
+        EnabledStatistics::Chunk
+    } else {
+        EnabledStatistics::None
+    }
+}
+
+fn data_page_encoding(column: &ColumnChunkMetaData) -> Option<Encoding> {
+    if let Some(stats) = column.page_encoding_stats() {
+        let mut counts: HashMap<Encoding, i32> = HashMap::new();
+        for stat in stats.iter() {
+            if !matches!(stat.page_type, PageType::DATA_PAGE | PageType::DATA_PAGE_V2) {
+                continue;
+            }
+            if is_level_encoding(stat.encoding) || is_dictionary_encoding(stat.encoding) {
+                continue;
+            }
+            *counts.entry(stat.encoding).or_insert(0) += stat.count;
+        }
+        if let Some((encoding, _)) = counts.into_iter().max_by_key(|(_, count)| *count) {
+            return Some(encoding);
+        }
+    }
+
+    let encodings = if let Some(mask) = column.page_encoding_stats_mask() {
+        mask.encodings().collect::<Vec<_>>()
+    } else {
+        column.encodings().collect::<Vec<_>>()
+    };
+
+    let mut encoding = encodings
+        .iter()
+        .copied()
+        .find(|encoding| !is_level_encoding(*encoding) && !is_dictionary_encoding(*encoding));
+
+    if encoding.is_none() && encodings.iter().any(|encoding| *encoding == Encoding::PLAIN) {
+        encoding = Some(Encoding::PLAIN);
+    }
+
+    encoding
+}
+
+#[allow(deprecated)]
+fn is_level_encoding(encoding: Encoding) -> bool {
+    matches!(encoding, Encoding::RLE | Encoding::BIT_PACKED)
+}
+
+fn is_dictionary_encoding(encoding: Encoding) -> bool {
+    matches!(encoding, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY)
 }
 
 struct ParquetIndexAppend<'a> {
