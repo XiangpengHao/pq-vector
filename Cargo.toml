@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "fs"] }
 
 [dev-dependencies]
 insta = "1.46.1"
+mimalloc = "0.1"
 tempfile = "3"
 
 [profile.dev.package.insta]
@@ -30,4 +31,3 @@ harness = false
 name = "query"
 path = "benches/query.rs"
 harness = false
-

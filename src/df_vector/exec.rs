@@ -23,7 +23,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics, collect,
 };
-use futures::stream;
+use futures::{future::join_all, stream};
 
 use crate::ivf::read_index_from_parquet;
 
@@ -99,8 +99,7 @@ impl VectorTopKExec {
             ))
         })?;
 
-        let mut file_entries = Vec::new();
-        let mut candidate_rows = 0usize;
+        let mut file_tasks = Vec::new();
         for file_group in scan.file_groups.iter() {
             for file in file_group.files().iter() {
                 let object_path = file.path().as_ref().to_string();
@@ -111,37 +110,49 @@ impl VectorTopKExec {
                                 "VectorTopK only supports local file:// paths".to_string(),
                             )
                         })?;
-                let (index, embedding_column) =
-                    read_index_from_parquet(&local_path).map_err(|err| {
-                        DataFusionError::Plan(format!(
-                            "Failed to read IVF index from {}: {}",
-                            local_path.display(),
-                            err
-                        ))
-                    })?;
-                if embedding_column.as_str() != self.vector_column {
-                    return Err(DataFusionError::Plan(format!(
-                        "IVF index column mismatch: expected '{}', found '{}'",
-                        self.vector_column,
-                        embedding_column.as_str()
-                    )));
-                }
-                if index.dim() != self.query.len() {
-                    return Err(DataFusionError::Plan(format!(
-                        "Query dimension mismatch: expected {}, got {}",
-                        index.dim(),
-                        self.query.len()
-                    )));
-                }
-                let candidates = index.candidate_rows(&self.query, self.options.nprobe);
-                candidate_rows += candidates.len();
-                let row_groups = read_row_group_row_counts(&local_path)?;
-                file_entries.push(FileEntry {
-                    object_path,
-                    row_groups,
-                    candidates,
-                });
+                let vector_column = self.vector_column.clone();
+                let query = self.query.clone();
+                let nprobe = self.options.nprobe;
+                file_tasks.push(tokio::task::spawn_blocking(move || {
+                    let (index, embedding_column) =
+                        read_index_from_parquet(&local_path).map_err(|err| {
+                            DataFusionError::Plan(format!(
+                                "Failed to read IVF index from {}: {}",
+                                local_path.display(),
+                                err
+                            ))
+                        })?;
+                    if embedding_column.as_str() != vector_column {
+                        return Err(DataFusionError::Plan(format!(
+                            "IVF index column mismatch: expected '{}', found '{}'",
+                            vector_column,
+                            embedding_column.as_str()
+                        )));
+                    }
+                    if index.dim() != query.len() {
+                        return Err(DataFusionError::Plan(format!(
+                            "Query dimension mismatch: expected {}, got {}",
+                            index.dim(),
+                            query.len()
+                        )));
+                    }
+                    let candidates = index.candidate_rows(&query, nprobe);
+                    let row_groups = read_row_group_row_counts(&local_path)?;
+                    Ok(FileEntry {
+                        object_path,
+                        row_groups,
+                        candidates,
+                    })
+                }));
             }
+        }
+
+        let mut file_entries = Vec::new();
+        for task in join_all(file_tasks).await {
+            let entry = task.map_err(|err| {
+                DataFusionError::Execution(format!("IVF index task failed: {err}"))
+            })??;
+            file_entries.push(entry);
         }
 
         if file_entries.is_empty() {
@@ -150,41 +161,37 @@ impl VectorTopKExec {
             ));
         }
 
+        let total_candidates: usize = file_entries
+            .iter()
+            .map(|entry| entry.candidates.len())
+            .sum();
         metrics.index_used.add(1);
-        metrics.candidate_rows.add(candidate_rows);
+        metrics.candidate_rows.add(total_candidates);
+
+        let max_candidates = self.options.max_candidates.unwrap_or(total_candidates);
+        let target_candidates = max_candidates.min(total_candidates);
 
         let mut cursor = CandidateCursor::new(file_entries.len());
         for (idx, entry) in file_entries.iter().enumerate() {
             cursor.add_candidates(idx, entry.candidates.clone());
         }
+        let selected = cursor.next_batch(target_candidates);
 
-        let max_candidates = self.options.max_candidates.unwrap_or(usize::MAX);
+        let mut selections: HashMap<String, Vec<u32>> = HashMap::new();
+        for (file_idx, row) in selected {
+            selections
+                .entry(file_entries[file_idx].object_path.clone())
+                .or_default()
+                .push(row);
+        }
+
+        let access_plans = build_access_plans(&file_entries, &selections)?;
+        let plan = rewrite_with_access_plans(self.scan_plan.clone(), &access_plans)?;
+        let batches = collect(plan, context.clone()).await?;
+
         let mut heap = BinaryHeap::new();
-        let mut scanned = 0usize;
-        let batch_size = context.session_config().batch_size();
-
-        while heap.len() < self.k && scanned < max_candidates {
-            let batch = cursor.next_batch(batch_size);
-            if batch.is_empty() {
-                break;
-            }
-
-            let mut selections: HashMap<String, Vec<u32>> = HashMap::new();
-            for (file_idx, row) in batch {
-                selections
-                    .entry(file_entries[file_idx].object_path.clone())
-                    .or_default()
-                    .push(row);
-            }
-
-            let access_plans = build_access_plans(&file_entries, &selections)?;
-            let plan = rewrite_with_access_plans(self.scan_plan.clone(), &access_plans)?;
-            let batches = collect(plan, context.clone()).await?;
-            scanned += selections.values().map(|v| v.len()).sum::<usize>();
-
-            for batch in batches {
-                update_topk_heap(&mut heap, &batch, vector_idx, &self.query, self.k, metrics)?;
-            }
+        for batch in batches {
+            update_topk_heap(&mut heap, &batch, vector_idx, &self.query, self.k, metrics)?;
         }
 
         let mut results: Vec<TopKRow> = heap.into_iter().collect();

@@ -1,5 +1,6 @@
 mod bench_util;
 
+use mimalloc::MiMalloc;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -7,6 +8,9 @@ use std::time::Instant;
 use pq_vector::IndexBuilder;
 
 use bench_util::{generate_parquet, to_mb};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const ROWS: usize = 1_000_000;
 const DIM: usize = 1024;

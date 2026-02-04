@@ -1,6 +1,6 @@
 use crate::ivf::index::{IvfBuildConfig, build_ivf_index};
 use crate::ivf::{ClusterCount, EmbeddingColumn, EmbeddingDim, Embeddings, IvfIndex};
-use arrow::array::{Array, Float32Array, ListArray, RecordBatch};
+use arrow::array::{Array, Float32Array, Float64Array, ListArray, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -217,12 +217,23 @@ fn read_parquet_with_embeddings(
         }
 
         let values = list_array.values();
-        let float_array = values
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or("Embedding values are not float32")?;
+        enum FloatValues<'a> {
+            F32(&'a Float32Array),
+            F64(&'a Float64Array),
+        }
+        let float_values = if let Some(array) = values.as_any().downcast_ref::<Float32Array>() {
+            FloatValues::F32(array)
+        } else if let Some(array) = values.as_any().downcast_ref::<Float64Array>() {
+            FloatValues::F64(array)
+        } else {
+            return Err("Embedding values are not float32/float64".into());
+        };
 
-        if float_array.null_count() > 0 {
+        let null_count = match &float_values {
+            FloatValues::F32(array) => array.null_count(),
+            FloatValues::F64(array) => array.null_count(),
+        };
+        if null_count > 0 {
             return Err("Embedding values contain nulls".into());
         }
 
@@ -241,8 +252,17 @@ fn read_parquet_with_embeddings(
             }
         }
 
-        for i in 0..float_array.len() {
-            all_embeddings.push(float_array.value(i));
+        match float_values {
+            FloatValues::F32(array) => {
+                for i in 0..array.len() {
+                    all_embeddings.push(array.value(i));
+                }
+            }
+            FloatValues::F64(array) => {
+                for i in 0..array.len() {
+                    all_embeddings.push(array.value(i) as f32);
+                }
+            }
         }
 
         batches.push(batch);
