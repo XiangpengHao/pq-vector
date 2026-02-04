@@ -9,7 +9,7 @@ use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{
     FileMetaData, FooterTail, KeyValue, ParquetMetaDataBuilder, ParquetMetaDataWriter,
 };
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
 use std::fs::{File, OpenOptions};
@@ -160,8 +160,8 @@ pub(crate) fn read_index_from_parquet(
     let file = File::open(path)?;
     let reader = SerializedFileReader::new(file.try_clone()?)?;
     let metadata = reader.metadata().file_metadata();
-    let metadata =
-        parse_index_metadata(metadata)?.ok_or("Missing pq-vector index metadata in parquet footer")?;
+    let metadata = parse_index_metadata(metadata)?
+        .ok_or("Missing pq-vector index metadata in parquet footer")?;
     let offset = metadata.offset;
     let embedding_column = metadata.embedding_column;
 
@@ -171,11 +171,7 @@ pub(crate) fn read_index_from_parquet(
     let mut magic_buf = vec![0u8; PQ_VECTOR_INDEX_MAGIC.len()];
     file.read_exact(&mut magic_buf)?;
     if magic_buf.as_slice() != PQ_VECTOR_INDEX_MAGIC {
-        return Err(format!(
-            "Invalid pq-vector index magic at offset {}",
-            offset
-        )
-        .into());
+        return Err(format!("Invalid pq-vector index magic at offset {}", offset).into());
     }
 
     let mut len_buf = [0u8; 8];
@@ -304,11 +300,14 @@ fn write_parquet_with_index(plan: ParquetWritePlan<'_>) -> Result<(), Box<dyn st
         "element".to_string(),
     ]);
 
+    println!("embedding_col_path: {:?}", embedding_col_path);
     let props = WriterProperties::builder()
         .set_data_page_size_limit(vector_size)
-        .set_data_page_row_count_limit(1)
-        .set_column_compression(embedding_col_path.clone(), Compression::LZ4_RAW)
-        .set_column_dictionary_enabled(embedding_col_path, false)
+        .set_column_compression(embedding_col_path.clone(), Compression::UNCOMPRESSED)
+        .set_column_dictionary_enabled(embedding_col_path.clone(), false)
+        .set_column_statistics_enabled(embedding_col_path.clone(), EnabledStatistics::Chunk)
+        .set_column_encoding(embedding_col_path.clone(), parquet::basic::Encoding::PLAIN)
+        .set_column_write_page_header_statistics(embedding_col_path, false)
         .build();
 
     let file = File::create(plan.path)?;
