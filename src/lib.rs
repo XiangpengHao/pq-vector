@@ -35,4 +35,4 @@
 pub mod df_vector;
 pub mod ivf;
 
-pub use ivf::{ClusterCount, IndexBuilder, SearchResult, TopkBuilder};
+pub use ivf::{ClusterCount, IndexBuilder, SearchResult, TopkBuilder, has_pq_vector_index};

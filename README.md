@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state = SessionStateBuilder::new()
         .with_default_features()
-        .with_pq_vector(options)
+        .with_pq_vector(options) // ENABLE pq-vector here!
         .build();
     let ctx = SessionContext::new_with_state(state);
 

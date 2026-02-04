@@ -99,14 +99,14 @@ impl IndexBuilder {
     }
 }
 
-/// Magic bytes to identify our IVF index format.
-const IVF_INDEX_MAGIC: &[u8] = b"IVF1";
+/// Magic bytes to identify our pq-vector index format.
+const PQ_VECTOR_INDEX_MAGIC: &[u8] = b"PQ_VECTOR1";
 
 /// Metadata key for the index offset.
-const IVF_INDEX_OFFSET_KEY: &str = "ivf_index_offset";
+const PQ_VECTOR_INDEX_OFFSET_KEY: &str = "pq_vector_index_offset";
 
 /// Metadata key for the embedding column name.
-const IVF_EMBEDDING_COLUMN_KEY: &str = "ivf_embedding_column";
+const PQ_VECTOR_EMBEDDING_COLUMN_KEY: &str = "pq_vector_embedding_column";
 
 #[derive(Debug, Clone)]
 struct IndexMetadata {
@@ -122,11 +122,11 @@ fn parse_index_metadata(
     };
     let offset = kv
         .iter()
-        .find(|k| k.key == IVF_INDEX_OFFSET_KEY)
+        .find(|k| k.key == PQ_VECTOR_INDEX_OFFSET_KEY)
         .and_then(|k| k.value.clone());
     let embedding = kv
         .iter()
-        .find(|k| k.key == IVF_EMBEDDING_COLUMN_KEY)
+        .find(|k| k.key == PQ_VECTOR_EMBEDDING_COLUMN_KEY)
         .and_then(|k| k.value.clone());
     let (Some(offset), Some(embedding)) = (offset, embedding) else {
         return Ok(None);
@@ -149,6 +149,11 @@ pub(crate) fn read_index_metadata(
     Ok(metadata.map(|meta| meta.embedding_column))
 }
 
+/// Returns true if the parquet file contains pq-vector index metadata.
+pub fn has_pq_vector_index(path: impl AsRef<Path>) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(read_index_metadata(path.as_ref())?.is_some())
+}
+
 pub(crate) fn read_index_from_parquet(
     path: &Path,
 ) -> Result<(IvfIndex, EmbeddingColumn), Box<dyn std::error::Error>> {
@@ -156,17 +161,21 @@ pub(crate) fn read_index_from_parquet(
     let reader = SerializedFileReader::new(file.try_clone()?)?;
     let metadata = reader.metadata().file_metadata();
     let metadata =
-        parse_index_metadata(metadata)?.ok_or("Missing IVF index metadata in parquet footer")?;
+        parse_index_metadata(metadata)?.ok_or("Missing pq-vector index metadata in parquet footer")?;
     let offset = metadata.offset;
     let embedding_column = metadata.embedding_column;
 
     let mut file = file;
     file.seek(SeekFrom::Start(offset))?;
 
-    let mut magic_buf = [0u8; 4];
+    let mut magic_buf = vec![0u8; PQ_VECTOR_INDEX_MAGIC.len()];
     file.read_exact(&mut magic_buf)?;
-    if magic_buf != IVF_INDEX_MAGIC {
-        return Err(format!("Invalid IVF index magic at offset {}", offset).into());
+    if magic_buf.as_slice() != PQ_VECTOR_INDEX_MAGIC {
+        return Err(format!(
+            "Invalid pq-vector index magic at offset {}",
+            offset
+        )
+        .into());
     }
 
     let mut len_buf = [0u8; 8];
@@ -316,16 +325,16 @@ fn write_parquet_with_index(plan: ParquetWritePlan<'_>) -> Result<(), Box<dyn st
     let index_bytes = plan.index.to_bytes();
     let index_len = index_bytes.len() as u64;
 
-    writer.write_all(IVF_INDEX_MAGIC)?;
+    writer.write_all(PQ_VECTOR_INDEX_MAGIC)?;
     writer.write_all(&index_len.to_le_bytes())?;
     writer.write_all(&index_bytes)?;
 
     writer.append_key_value_metadata(KeyValue::new(
-        IVF_INDEX_OFFSET_KEY.to_string(),
+        PQ_VECTOR_INDEX_OFFSET_KEY.to_string(),
         index_offset.to_string(),
     ));
     writer.append_key_value_metadata(KeyValue::new(
-        IVF_EMBEDDING_COLUMN_KEY.to_string(),
+        PQ_VECTOR_EMBEDDING_COLUMN_KEY.to_string(),
         plan.embedding_column.as_str().to_string(),
     ));
 
@@ -371,13 +380,15 @@ fn append_index_inplace(plan: ParquetIndexAppend<'_>) -> Result<(), Box<dyn std:
         .key_value_metadata()
         .cloned()
         .unwrap_or_default();
-    key_values.retain(|kv| kv.key != IVF_INDEX_OFFSET_KEY && kv.key != IVF_EMBEDDING_COLUMN_KEY);
+    key_values.retain(|kv| {
+        kv.key != PQ_VECTOR_INDEX_OFFSET_KEY && kv.key != PQ_VECTOR_EMBEDDING_COLUMN_KEY
+    });
     key_values.push(KeyValue::new(
-        IVF_INDEX_OFFSET_KEY.to_string(),
+        PQ_VECTOR_INDEX_OFFSET_KEY.to_string(),
         index_offset.to_string(),
     ));
     key_values.push(KeyValue::new(
-        IVF_EMBEDDING_COLUMN_KEY.to_string(),
+        PQ_VECTOR_EMBEDDING_COLUMN_KEY.to_string(),
         plan.embedding_column.as_str().to_string(),
     ));
 
@@ -398,7 +409,7 @@ fn append_index_inplace(plan: ParquetIndexAppend<'_>) -> Result<(), Box<dyn std:
 
     let index_bytes = plan.index.to_bytes();
     let index_len = index_bytes.len() as u64;
-    file.write_all(IVF_INDEX_MAGIC)?;
+    file.write_all(PQ_VECTOR_INDEX_MAGIC)?;
     file.write_all(&index_len.to_le_bytes())?;
     file.write_all(&index_bytes)?;
 

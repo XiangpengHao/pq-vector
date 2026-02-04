@@ -11,7 +11,7 @@ mod search;
 use std::num::NonZeroU32;
 
 pub use index::ClusterCount;
-pub use parquet::IndexBuilder;
+pub use parquet::{IndexBuilder, has_pq_vector_index};
 pub use search::{SearchResult, TopkBuilder};
 
 /// Non-empty embedding column name.

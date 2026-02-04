@@ -11,11 +11,11 @@ expression: tree_str
 │       VectorTopKExec      │
 │    --------------------   │
 │     batches_fetched: 1    │
-│    candidate_rows: 396    │
+│    candidate_rows: 496    │
 │     column: embedding     │
 │                           │
 │    embeddings_fetched:    │
-│            396            │
+│            496            │
 │                           │
 │      index_used: true     │
 │            k: 3           │
