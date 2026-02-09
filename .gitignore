@@ -1,4 +1,4 @@
 /target
-data
+data/*
+!data/vldb_2025.parquet
 profile.json.gz
-

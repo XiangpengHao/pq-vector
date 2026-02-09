@@ -456,9 +456,7 @@ fn column_write_options(column: &ColumnChunkMetaData) -> ColumnWriteOptions {
 
 fn column_uses_dictionary(column: &ColumnChunkMetaData) -> bool {
     column.dictionary_page_offset().is_some()
-        || column
-            .encodings()
-            .any(|encoding| is_dictionary_encoding(encoding))
+        || column.encodings().any(is_dictionary_encoding)
 }
 
 fn column_statistics_level(column: &ColumnChunkMetaData) -> EnabledStatistics {
@@ -499,11 +497,7 @@ fn data_page_encoding(column: &ColumnChunkMetaData) -> Option<Encoding> {
         .copied()
         .find(|encoding| !is_level_encoding(*encoding) && !is_dictionary_encoding(*encoding));
 
-    if encoding.is_none()
-        && encodings
-            .iter()
-            .any(|encoding| *encoding == Encoding::PLAIN)
-    {
+    if encoding.is_none() && encodings.contains(&Encoding::PLAIN) {
         encoding = Some(Encoding::PLAIN);
     }
 
