@@ -455,8 +455,7 @@ fn column_write_options(column: &ColumnChunkMetaData) -> ColumnWriteOptions {
 }
 
 fn column_uses_dictionary(column: &ColumnChunkMetaData) -> bool {
-    column.dictionary_page_offset().is_some()
-        || column.encodings().any(is_dictionary_encoding)
+    column.dictionary_page_offset().is_some() || column.encodings().any(is_dictionary_encoding)
 }
 
 fn column_statistics_level(column: &ColumnChunkMetaData) -> EnabledStatistics {
