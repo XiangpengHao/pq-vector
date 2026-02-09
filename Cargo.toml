@@ -2,6 +2,13 @@
 name = "pq-vector"
 version = "0.1.0"
 edition = "2024"
+description = "Vector search with Parquet and DataFusion."
+license = "MIT"
+repository = "https://github.com/XiangpengHao/pq-vector"
+readme = "README.md"
+documentation = "https://docs.rs/pq-vector"
+keywords = ["vector", "parquet", "datafusion", "search"]
+categories = ["algorithms", "database-implementations"]
 
 [dependencies]
 arrow = "57.2.0"

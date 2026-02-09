@@ -16,8 +16,8 @@ use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let source = std::env::var("PQ_VECTOR_SOURCE")
-        .unwrap_or_else(|_| "data/vldb_2025.parquet".to_string());
+    let source =
+        std::env::var("PQ_VECTOR_SOURCE").unwrap_or_else(|_| "data/vldb_2025.parquet".to_string());
     let indexed = std::env::var("PQ_VECTOR_INDEXED")
         .unwrap_or_else(|_| "data/vldb_2025_indexed.parquet".to_string());
     let query_row: usize = std::env::var("PQ_VECTOR_QUERY_ROW")

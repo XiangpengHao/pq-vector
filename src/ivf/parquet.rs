@@ -2,8 +2,8 @@ use crate::ivf::index::{IvfBuildConfig, build_ivf_index};
 use crate::ivf::{ClusterCount, EmbeddingColumn, EmbeddingDim, Embeddings, IvfIndex};
 use arrow::array::{Array, Float32Array, Float64Array, ListArray, RecordBatch};
 use arrow::datatypes::SchemaRef;
-use parquet::arrow::{ArrowSchemaConverter, ArrowWriter};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::{ArrowSchemaConverter, ArrowWriter};
 use parquet::basic::{Compression, Encoding, PageType};
 use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{
@@ -456,7 +456,9 @@ fn column_write_options(column: &ColumnChunkMetaData) -> ColumnWriteOptions {
 
 fn column_uses_dictionary(column: &ColumnChunkMetaData) -> bool {
     column.dictionary_page_offset().is_some()
-        || column.encodings().any(|encoding| is_dictionary_encoding(encoding))
+        || column
+            .encodings()
+            .any(|encoding| is_dictionary_encoding(encoding))
 }
 
 fn column_statistics_level(column: &ColumnChunkMetaData) -> EnabledStatistics {
@@ -497,7 +499,11 @@ fn data_page_encoding(column: &ColumnChunkMetaData) -> Option<Encoding> {
         .copied()
         .find(|encoding| !is_level_encoding(*encoding) && !is_dictionary_encoding(*encoding));
 
-    if encoding.is_none() && encodings.iter().any(|encoding| *encoding == Encoding::PLAIN) {
+    if encoding.is_none()
+        && encodings
+            .iter()
+            .any(|encoding| *encoding == Encoding::PLAIN)
+    {
         encoding = Some(Encoding::PLAIN);
     }
 
@@ -510,7 +516,10 @@ fn is_level_encoding(encoding: Encoding) -> bool {
 }
 
 fn is_dictionary_encoding(encoding: Encoding) -> bool {
-    matches!(encoding, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY)
+    matches!(
+        encoding,
+        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+    )
 }
 
 struct ParquetIndexAppend<'a> {

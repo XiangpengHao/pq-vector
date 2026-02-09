@@ -118,6 +118,21 @@ let state = SessionStateBuilder::new()
 - `k` controls how many results you return.
 - `nprobe` trades speed for recall (higher = more accurate, slower).
 
+## Releasing to crates.io
+
+This repo uses `release-plz` with token-based publishing.
+
+### Required GitHub secrets
+
+- `CARGO_REGISTRY_TOKEN`: crates.io API token with publish permission
+
+### Workflow
+
+1. Merge changes into `main`.
+2. GitHub Action `release-pr` opens or updates a release PR with version/changelog changes.
+3. Merge the release PR.
+4. Manually run the `release` workflow from the Actions tab to publish to crates.io.
+
 ## License
 
 MIT
