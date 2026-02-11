@@ -3,6 +3,7 @@
 mod access;
 mod exec;
 mod expr;
+mod index_exec;
 mod options;
 mod physical;
 mod session;

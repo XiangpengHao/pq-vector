@@ -1,7 +1,6 @@
 //! Parquet access plan helpers and IVF candidate cursor.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use datafusion::common::Result;
@@ -12,14 +11,20 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_plan::ExecutionPlan;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-use parquet::file::reader::FileReader;
-use parquet::file::serialized_reader::SerializedFileReader;
 
 #[derive(Clone)]
 pub(crate) struct FileEntry {
     pub(crate) object_path: String,
     pub(crate) row_groups: Vec<u64>,
     pub(crate) candidates: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanFile {
+    pub(crate) object_store_url: ObjectStoreUrl,
+    pub(crate) object_path: String,
+    pub(crate) file_size: u64,
+    pub(crate) metadata_size_hint: Option<usize>,
 }
 
 pub(crate) struct ParquetScanInfo {
@@ -170,32 +175,19 @@ fn build_row_selection(row_count: usize, rows: &[u32]) -> Result<RowSelection> {
     Ok(RowSelection::from(selectors))
 }
 
-pub(crate) fn read_row_group_row_counts(path: &Path) -> Result<Vec<u64>> {
-    let file = std::fs::File::open(path).map_err(datafusion::common::DataFusionError::from)?;
-    let reader =
-        SerializedFileReader::new(file).map_err(datafusion::common::DataFusionError::from)?;
-    let metadata = reader.metadata();
-    let counts = metadata
-        .row_groups()
-        .iter()
-        .map(|rg| rg.num_rows() as u64)
-        .collect::<Vec<_>>();
-    Ok(counts)
-}
-
-pub(crate) fn local_path_from_object_store(
-    object_store_url: &ObjectStoreUrl,
-    path: &str,
-) -> Option<PathBuf> {
-    if !object_store_url.as_str().starts_with("file://") {
-        return None;
+pub(crate) fn parquet_scan_files(scan: &ParquetScanInfo) -> Vec<ScanFile> {
+    let mut files = Vec::new();
+    for file_group in scan.file_groups.iter() {
+        for file in file_group.files().iter() {
+            files.push(ScanFile {
+                object_store_url: scan.object_store_url.clone(),
+                object_path: file.path().as_ref().to_string(),
+                file_size: file.object_meta.size,
+                metadata_size_hint: file.metadata_size_hint,
+            });
+        }
     }
-    if path.starts_with('/') {
-        return Some(PathBuf::from(path));
-    }
-    let mut full = PathBuf::from("/");
-    full.push(path);
-    Some(full)
+    files
 }
 
 pub(crate) struct CandidateCursor {

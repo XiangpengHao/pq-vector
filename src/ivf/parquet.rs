@@ -142,14 +142,45 @@ fn parse_index_metadata(
     }))
 }
 
+pub(crate) fn read_index_metadata_from_file_metadata(
+    metadata: &FileMetaData,
+) -> Result<Option<(u64, EmbeddingColumn)>, Box<dyn std::error::Error>> {
+    Ok(parse_index_metadata(metadata)?.map(|meta| (meta.offset, meta.embedding_column)))
+}
+
+pub(crate) fn read_index_from_payload(
+    payload: &[u8],
+    embedding_column: EmbeddingColumn,
+) -> Result<(IvfIndex, EmbeddingColumn), Box<dyn std::error::Error>> {
+    let header_len = PQ_VECTOR_INDEX_MAGIC.len() + std::mem::size_of::<u64>();
+    if payload.len() < header_len {
+        return Err("pq-vector index payload is truncated".into());
+    }
+
+    if &payload[..PQ_VECTOR_INDEX_MAGIC.len()] != PQ_VECTOR_INDEX_MAGIC {
+        return Err("Invalid pq-vector index magic".into());
+    }
+
+    let mut len_buf = [0u8; 8];
+    len_buf.copy_from_slice(&payload[PQ_VECTOR_INDEX_MAGIC.len()..header_len]);
+    let index_len = u64::from_le_bytes(len_buf) as usize;
+    if payload.len() < header_len + index_len {
+        return Err("pq-vector index bytes are truncated".into());
+    }
+
+    let index_bytes = &payload[header_len..header_len + index_len];
+    let index = IvfIndex::from_bytes(index_bytes)?;
+    Ok((index, embedding_column))
+}
+
 pub(crate) fn read_index_metadata(
     path: &Path,
 ) -> Result<Option<EmbeddingColumn>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let reader = SerializedFileReader::new(file)?;
     let metadata = reader.metadata().file_metadata();
-    let metadata = parse_index_metadata(metadata)?;
-    Ok(metadata.map(|meta| meta.embedding_column))
+    Ok(read_index_metadata_from_file_metadata(metadata)?
+        .map(|(_offset, embedding_column)| embedding_column))
 }
 
 /// Returns true if the parquet file contains pq-vector index metadata.
@@ -163,30 +194,17 @@ pub(crate) fn read_index_from_parquet(
     let file = File::open(path)?;
     let reader = SerializedFileReader::new(file.try_clone()?)?;
     let metadata = reader.metadata().file_metadata();
-    let metadata = parse_index_metadata(metadata)?
+    let (offset, embedding_column) = read_index_metadata_from_file_metadata(metadata)?
         .ok_or("Missing pq-vector index metadata in parquet footer")?;
-    let offset = metadata.offset;
-    let embedding_column = metadata.embedding_column;
 
     let mut file = file;
     file.seek(SeekFrom::Start(offset))?;
 
-    let mut magic_buf = vec![0u8; PQ_VECTOR_INDEX_MAGIC.len()];
-    file.read_exact(&mut magic_buf)?;
-    if magic_buf.as_slice() != PQ_VECTOR_INDEX_MAGIC {
-        return Err(format!("Invalid pq-vector index magic at offset {}", offset).into());
-    }
-
-    let mut len_buf = [0u8; 8];
-    file.read_exact(&mut len_buf)?;
-    let index_len = u64::from_le_bytes(len_buf) as usize;
-
-    let mut index_bytes = vec![0u8; index_len];
-    file.read_exact(&mut index_bytes)?;
-
-    let index = IvfIndex::from_bytes(&index_bytes)?;
-
-    Ok((index, embedding_column))
+    let mut payload = Vec::new();
+    file.read_to_end(&mut payload)?;
+    read_index_from_payload(&payload, embedding_column).map_err(|err| {
+        format!("Failed to decode pq-vector index payload at offset {offset}: {err}").into()
+    })
 }
 
 struct ParquetEmbeddings {

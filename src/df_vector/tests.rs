@@ -148,6 +148,98 @@ async fn vector_topk_vldb_tree_snapshot() -> datafusion::common::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn vector_topk_applies_filters_after_candidate_pruning() -> datafusion::common::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let source_path = temp_dir.path().join("source.parquet");
+    let indexed_path = temp_dir.path().join("indexed.parquet");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "vec",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            false,
+        ),
+    ]));
+
+    let ids = Int32Array::from(vec![0, 1, 2, 3, 4, 5]);
+    let vectors = vec![
+        Some(vec![Some(0.0), Some(0.0)]),
+        Some(vec![Some(0.05), Some(0.05)]),
+        Some(vec![Some(0.2), Some(0.2)]),
+        Some(vec![Some(1.0), Some(1.0)]),
+        Some(vec![Some(1.1), Some(1.1)]),
+        Some(vec![Some(1.4), Some(1.4)]),
+    ];
+    let vec_array = ListArray::from_iter_primitive::<Float32Type, _, _>(vectors);
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(ids), Arc::new(vec_array)],
+    )?;
+
+    let file = std::fs::File::create(&source_path).unwrap();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    IndexBuilder::new(source_path.as_path(), "vec")
+        .build_new(indexed_path.as_path())
+        .unwrap();
+
+    let options = VectorTopKOptions {
+        nprobe: 64,
+        max_candidates: None,
+    };
+    let config = SessionConfig::new().with_target_partitions(2);
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(VectorTopKPhysicalOptimizerRule::new(options)))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+
+    ctx.register_parquet(
+        "t",
+        indexed_path.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let df = ctx
+        .sql(
+            "SELECT id FROM t \
+             WHERE id >= 3 \
+             ORDER BY array_distance(vec, [0.0, 0.0]) \
+             LIMIT 2",
+        )
+        .await
+        .unwrap();
+
+    let plan = df.clone().create_physical_plan().await?;
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+
+    let mut result_ids = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..ids.len() {
+            result_ids.push(ids.value(i));
+        }
+    }
+
+    assert_eq!(result_ids, vec![3, 4]);
+
+    let tree_str = displayable(plan.as_ref()).tree_render().to_string();
+    assert_snapshot!("vector_topk_filter_plan_tree", tree_str);
+
+    Ok(())
+}
+
 fn build_context(options: VectorTopKOptions) -> SessionContext {
     let config = SessionConfig::new().with_target_partitions(2);
     let state = SessionStateBuilder::new()

@@ -8,11 +8,12 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
-    RecordBatch,
+    RecordBatch, StringArray, UInt32Array,
 };
 use arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result, ScalarValue, assert_eq_or_internal_err};
 use datafusion::execution::TaskContext;
+use datafusion::object_store::path::Path as ObjectStorePath;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricType, MetricsSet,
@@ -23,19 +24,20 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics, collect,
 };
-use futures::{future::join_all, stream};
-
-use crate::ivf::read_index_from_parquet;
+use futures::stream;
+use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 
 use super::access::{
     CandidateCursor, FileEntry, ParquetScanInfo, build_access_plans, gather_single_parquet_scan,
-    local_path_from_object_store, read_row_group_row_counts, rewrite_with_access_plans,
+    parquet_scan_files, rewrite_with_access_plans,
 };
+use super::index_exec::{INDEX_PATH_COL, INDEX_ROW_ID_COL, VectorIndexScanExec};
 use super::options::VectorTopKOptions;
 
 /// Execution plan for VectorTopK.
 #[derive(Clone)]
 pub(crate) struct VectorTopKExec {
+    index_plan: Arc<dyn ExecutionPlan>,
     scan_plan: Arc<dyn ExecutionPlan>,
     vector_column: String,
     query: Vec<f32>,
@@ -47,7 +49,8 @@ pub(crate) struct VectorTopKExec {
 }
 
 impl VectorTopKExec {
-    pub(crate) fn new(
+    fn new_inner(
+        index_plan: Arc<dyn ExecutionPlan>,
         scan_plan: Arc<dyn ExecutionPlan>,
         vector_column: String,
         query: Vec<f32>,
@@ -63,6 +66,7 @@ impl VectorTopKExec {
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         );
         Self {
+            index_plan,
             scan_plan,
             vector_column,
             query,
@@ -74,87 +78,138 @@ impl VectorTopKExec {
         }
     }
 
-    async fn execute_topk(
-        &self,
-        context: Arc<TaskContext>,
-        metrics: &VectorTopKMetricHandles,
-    ) -> Result<RecordBatch> {
-        let scan_info = gather_single_parquet_scan(&self.scan_plan)?.ok_or_else(|| {
+    pub(crate) fn try_new(
+        scan_plan: Arc<dyn ExecutionPlan>,
+        vector_column: String,
+        query: Vec<f32>,
+        k: usize,
+        options: VectorTopKOptions,
+    ) -> Result<Self> {
+        let scan_info = gather_single_parquet_scan(&scan_plan)?.ok_or_else(|| {
             DataFusionError::Plan("VectorTopKExec requires a single parquet scan input".to_string())
         })?;
-        self.execute_with_index(&scan_info, context, metrics).await
+        let files = parquet_scan_files(&scan_info);
+        let index_plan = Arc::new(VectorIndexScanExec::new(
+            files,
+            vector_column.clone(),
+            query.clone(),
+            options.clone(),
+        ));
+        Ok(Self::new_inner(
+            index_plan,
+            scan_plan,
+            vector_column,
+            query,
+            k,
+            options,
+        ))
     }
 
-    async fn execute_with_index(
+    async fn collect_candidates(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> Result<HashMap<String, Vec<u32>>> {
+        let batches = collect(self.index_plan.clone(), context).await?;
+        let mut selections: HashMap<String, Vec<u32>> = HashMap::new();
+        for batch in batches {
+            let object_paths = batch
+                .column_by_name(INDEX_PATH_COL)
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "VectorIndexScanExec output missing column '{}'",
+                        INDEX_PATH_COL
+                    ))
+                })?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "VectorIndexScanExec output column '{}' must be Utf8",
+                        INDEX_PATH_COL
+                    ))
+                })?;
+            let row_ids = batch
+                .column_by_name(INDEX_ROW_ID_COL)
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "VectorIndexScanExec output missing column '{}'",
+                        INDEX_ROW_ID_COL
+                    ))
+                })?
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "VectorIndexScanExec output column '{}' must be UInt32",
+                        INDEX_ROW_ID_COL
+                    ))
+                })?;
+            for row in 0..batch.num_rows() {
+                selections
+                    .entry(object_paths.value(row).to_string())
+                    .or_default()
+                    .push(row_ids.value(row));
+            }
+        }
+        Ok(selections)
+    }
+
+    async fn files_with_candidates(
         &self,
         scan: &ParquetScanInfo,
         context: Arc<TaskContext>,
+        mut candidate_rows: HashMap<String, Vec<u32>>,
+    ) -> Result<Vec<FileEntry>> {
+        let mut files = Vec::new();
+        for scan_file in parquet_scan_files(scan) {
+            let location = ObjectStorePath::parse(&scan_file.object_path).map_err(|err| {
+                DataFusionError::Execution(format!(
+                    "Invalid object-store path '{}': {}",
+                    scan_file.object_path, err
+                ))
+            })?;
+            let store = context
+                .runtime_env()
+                .object_store(scan_file.object_store_url.clone())?;
+            let mut reader =
+                ParquetObjectReader::new(store, location).with_file_size(scan_file.file_size);
+            if let Some(hint) = scan_file.metadata_size_hint {
+                reader = reader.with_footer_size_hint(hint);
+            }
+            let metadata = reader.get_metadata(None).await.map_err(|err| {
+                DataFusionError::Execution(format!(
+                    "Failed to read parquet metadata from '{}': {}",
+                    scan_file.object_path, err
+                ))
+            })?;
+            let row_groups = metadata
+                .row_groups()
+                .iter()
+                .map(|rg| rg.num_rows() as u64)
+                .collect::<Vec<_>>();
+            let candidates = candidate_rows
+                .remove(&scan_file.object_path)
+                .unwrap_or_default();
+            files.push(FileEntry {
+                object_path: scan_file.object_path,
+                row_groups,
+                candidates,
+            });
+        }
+        if !candidate_rows.is_empty() {
+            return Err(DataFusionError::Internal(
+                "VectorIndexScanExec produced candidates for unknown files".to_string(),
+            ));
+        }
+        Ok(files)
+    }
+
+    async fn execute_with_candidates(
+        &self,
+        file_entries: &[FileEntry],
+        context: Arc<TaskContext>,
         metrics: &VectorTopKMetricHandles,
     ) -> Result<RecordBatch> {
-        let schema = self.scan_plan.schema();
-        let vector_idx = schema.index_of(&self.vector_column).map_err(|_| {
-            DataFusionError::Plan(format!(
-                "Vector column '{}' not found in schema",
-                self.vector_column
-            ))
-        })?;
-
-        let mut file_tasks = Vec::new();
-        for file_group in scan.file_groups.iter() {
-            for file in file_group.files().iter() {
-                let object_path = file.path().as_ref().to_string();
-                let local_path =
-                    local_path_from_object_store(&scan.object_store_url, file.path().as_ref())
-                        .ok_or_else(|| {
-                            DataFusionError::Plan(
-                                "VectorTopK only supports local file:// paths".to_string(),
-                            )
-                        })?;
-                let vector_column = self.vector_column.clone();
-                let query = self.query.clone();
-                let nprobe = self.options.nprobe;
-                file_tasks.push(tokio::task::spawn_blocking(move || {
-                    let (index, embedding_column) =
-                        read_index_from_parquet(&local_path).map_err(|err| {
-                            DataFusionError::Plan(format!(
-                                "Failed to read IVF index from {}: {}",
-                                local_path.display(),
-                                err
-                            ))
-                        })?;
-                    if embedding_column.as_str() != vector_column {
-                        return Err(DataFusionError::Plan(format!(
-                            "IVF index column mismatch: expected '{}', found '{}'",
-                            vector_column,
-                            embedding_column.as_str()
-                        )));
-                    }
-                    if index.dim() != query.len() {
-                        return Err(DataFusionError::Plan(format!(
-                            "Query dimension mismatch: expected {}, got {}",
-                            index.dim(),
-                            query.len()
-                        )));
-                    }
-                    let candidates = index.candidate_rows(&query, nprobe);
-                    let row_groups = read_row_group_row_counts(&local_path)?;
-                    Ok(FileEntry {
-                        object_path,
-                        row_groups,
-                        candidates,
-                    })
-                }));
-            }
-        }
-
-        let mut file_entries = Vec::new();
-        for task in join_all(file_tasks).await {
-            let entry = task.map_err(|err| {
-                DataFusionError::Execution(format!("IVF index task failed: {err}"))
-            })??;
-            file_entries.push(entry);
-        }
-
         if file_entries.is_empty() {
             return Err(DataFusionError::Plan(
                 "VectorTopKExec requires at least one indexed parquet file".to_string(),
@@ -185,10 +240,29 @@ impl VectorTopKExec {
                 .push(row);
         }
 
-        let access_plans = build_access_plans(&file_entries, &selections)?;
+        let access_plans = build_access_plans(file_entries, &selections)?;
         let plan = rewrite_with_access_plans(self.scan_plan.clone(), &access_plans)?;
         let batches = collect(plan, context.clone()).await?;
+        self.topk_from_batches(batches, metrics)
+    }
 
+    fn vector_column_index(&self) -> Result<usize> {
+        let schema = self.scan_plan.schema();
+        schema.index_of(&self.vector_column).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "Vector column '{}' not found in schema",
+                self.vector_column
+            ))
+        })
+    }
+
+    fn topk_from_batches(
+        &self,
+        batches: Vec<RecordBatch>,
+        metrics: &VectorTopKMetricHandles,
+    ) -> Result<RecordBatch> {
+        let schema = self.scan_plan.schema();
+        let vector_idx = self.vector_column_index()?;
         let mut heap = BinaryHeap::new();
         for batch in batches {
             update_topk_heap(&mut heap, &batch, vector_idx, &self.query, self.k, metrics)?;
@@ -200,10 +274,24 @@ impl VectorTopKExec {
                 .partial_cmp(&b.distance)
                 .unwrap_or(Ordering::Equal)
         });
-
         let rows = results.into_iter().map(|r| r.values).collect::<Vec<_>>();
-        let schema = self.scan_plan.schema();
         build_batch_from_rows(schema, rows)
+    }
+
+    async fn execute_topk(
+        &self,
+        context: Arc<TaskContext>,
+        metrics: &VectorTopKMetricHandles,
+    ) -> Result<RecordBatch> {
+        let scan_info = gather_single_parquet_scan(&self.scan_plan)?.ok_or_else(|| {
+            DataFusionError::Plan("VectorTopKExec requires a single parquet scan input".to_string())
+        })?;
+        let candidate_rows = self.collect_candidates(context.clone()).await?;
+        let file_entries = self
+            .files_with_candidates(&scan_info, context.clone(), candidate_rows)
+            .await?;
+        self.execute_with_candidates(&file_entries, context, metrics)
+            .await
     }
 }
 
@@ -269,23 +357,33 @@ impl ExecutionPlan for VectorTopKExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![]
+        vec![
+            Distribution::UnspecifiedDistribution,
+            Distribution::UnspecifiedDistribution,
+        ]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
+        vec![&self.index_plan, &self.scan_plan]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
+        if children.len() != 2 {
             return Err(DataFusionError::Plan(
-                "VectorTopKExec does not accept children".to_string(),
+                "VectorTopKExec expects exactly two children".to_string(),
             ));
         }
-        Ok(self)
+        Ok(Arc::new(Self::new_inner(
+            children[0].clone(),
+            children[1].clone(),
+            self.vector_column.clone(),
+            self.query.clone(),
+            self.k,
+            self.options.clone(),
+        )))
     }
 
     fn execute(

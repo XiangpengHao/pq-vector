@@ -16,12 +16,21 @@ expression: tree_str
 │                           │
 │    embeddings_fetched:    │
 │            496            │
-│                           │
-│      index_used: true     │
-│            k: 3           │
-│    max_candidates: 2048   │
-│         nprobe: 32        │
-│      query_dim: 4096      │
-│                           │
-│        vector_topk        │
-└───────────────────────────┘
+│                           ├──────────────┐
+│      index_used: true     │              │
+│            k: 3           │              │
+│    max_candidates: 2048   │              │
+│         nprobe: 32        │              │
+│      query_dim: 4096      │              │
+│                           │              │
+│        vector_topk        │              │
+└─────────────┬─────────────┘              │
+┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+│    VectorIndexScanExec    ││       DataSourceExec      │
+│    --------------------   ││    --------------------   │
+│     column: embedding     ││          files: 1         │
+│         nprobe: 32        ││      format: parquet      │
+│      query_dim: 4096      ││                           │
+│                           ││                           │
+│     vector_index_scan     ││                           │
+└───────────────────────────┘└───────────────────────────┘
