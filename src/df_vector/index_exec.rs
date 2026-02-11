@@ -12,7 +12,8 @@ use datafusion::execution::TaskContext;
 use datafusion::object_store::path::Path as ObjectStorePath;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricType, MetricsSet,
+    RecordOutput,
 };
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -45,6 +46,7 @@ pub(crate) struct VectorIndexScanExec {
     schema: SchemaRef,
     cache: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
+    metric_handles: VectorIndexScanMetricHandles,
 }
 
 impl VectorIndexScanExec {
@@ -64,6 +66,8 @@ impl VectorIndexScanExec {
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         );
+        let metrics = ExecutionPlanMetricsSet::new();
+        let metric_handles = VectorIndexScanMetricHandles::new(&metrics, 0);
         Self {
             files,
             vector_column,
@@ -71,7 +75,8 @@ impl VectorIndexScanExec {
             options,
             schema,
             cache,
-            metrics: ExecutionPlanMetricsSet::new(),
+            metrics,
+            metric_handles,
         }
     }
 
@@ -158,6 +163,10 @@ impl VectorIndexScanExec {
             });
         }
 
+        self.metric_handles.files_scanned.add(files.len());
+        let candidate_rows = files.iter().map(|f| f.candidates.len()).sum::<usize>();
+        self.metric_handles.candidate_rows.add(candidate_rows);
+
         let total_rows = files.iter().map(|f| f.candidates.len()).sum::<usize>();
         let mut paths = Vec::with_capacity(total_rows);
         let mut row_ids = Vec::with_capacity(total_rows);
@@ -193,9 +202,17 @@ impl DisplayAs for VectorIndexScanExec {
             }
             DisplayFormatType::TreeRender => {
                 writeln!(f, "vector_index_scan")?;
-                writeln!(f, "column={}", self.vector_column)?;
-                writeln!(f, "query_dim={}", self.query.len())?;
-                writeln!(f, "nprobe={}", self.options.nprobe)?;
+                writeln!(f, "files={}", self.files.len())?;
+                writeln!(
+                    f,
+                    "files_scanned={}",
+                    self.metric_handles.files_scanned.value()
+                )?;
+                writeln!(
+                    f,
+                    "candidate_rows={}",
+                    self.metric_handles.candidate_rows.value()
+                )?;
                 Ok(())
             }
         }
@@ -260,5 +277,24 @@ impl ExecutionPlan for VectorIndexScanExec {
 
     fn statistics(&self) -> Result<Statistics> {
         Ok(Statistics::new_unknown(&self.schema()))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VectorIndexScanMetricHandles {
+    files_scanned: Count,
+    candidate_rows: Count,
+}
+
+impl VectorIndexScanMetricHandles {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            files_scanned: MetricBuilder::new(metrics)
+                .with_type(MetricType::SUMMARY)
+                .counter("files_scanned", partition),
+            candidate_rows: MetricBuilder::new(metrics)
+                .with_type(MetricType::SUMMARY)
+                .counter("candidate_rows", partition),
+        }
     }
 }

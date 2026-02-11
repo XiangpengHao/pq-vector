@@ -220,8 +220,6 @@ impl VectorTopKExec {
             .iter()
             .map(|entry| entry.candidates.len())
             .sum();
-        metrics.index_used.add(1);
-        metrics.candidate_rows.add(total_candidates);
 
         let max_candidates = self.options.max_candidates.unwrap_or(total_candidates);
         let target_candidates = max_candidates.min(total_candidates);
@@ -318,16 +316,6 @@ impl DisplayAs for VectorTopKExec {
                 }
                 writeln!(
                     f,
-                    "index_used={}",
-                    self.metric_handles.index_used.value() > 0
-                )?;
-                writeln!(
-                    f,
-                    "candidate_rows={}",
-                    self.metric_handles.candidate_rows.value()
-                )?;
-                writeln!(
-                    f,
                     "embeddings_fetched={}",
                     self.metric_handles.embeddings_fetched.value()
                 )?;
@@ -416,8 +404,6 @@ impl ExecutionPlan for VectorTopKExec {
 
 #[derive(Debug, Clone)]
 struct VectorTopKMetricHandles {
-    index_used: Count,
-    candidate_rows: Count,
     embeddings_fetched: Count,
     batches_fetched: Count,
 }
@@ -425,12 +411,6 @@ struct VectorTopKMetricHandles {
 impl VectorTopKMetricHandles {
     fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
-            index_used: MetricBuilder::new(metrics)
-                .with_type(MetricType::SUMMARY)
-                .counter("index_used", partition),
-            candidate_rows: MetricBuilder::new(metrics)
-                .with_type(MetricType::SUMMARY)
-                .counter("candidate_rows", partition),
             embeddings_fetched: MetricBuilder::new(metrics)
                 .with_type(MetricType::SUMMARY)
                 .counter("embeddings_fetched", partition),

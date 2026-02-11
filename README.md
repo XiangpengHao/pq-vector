@@ -85,7 +85,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let df = ctx
-        .sql("SELECT id FROM t ORDER BY array_distance(embedding, [0.0, 0.0]) LIMIT 5")
+        .sql(
+            r#"
+            SELECT id
+            FROM t
+            WHERE id >= 100
+            ORDER BY array_distance(embedding, [0.0, 0.0])
+            LIMIT 5
+            "#,
+        )
         .await?;
     let _batches = df.collect().await?;
     Ok(())

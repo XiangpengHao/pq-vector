@@ -11,11 +11,9 @@ expression: tree_str
 │       VectorTopKExec      │
 │    --------------------   │
 │     batches_fetched: 1    │
-│     candidate_rows: 6     │
 │        column: vec        │
 │   embeddings_fetched: 3   │
-│      index_used: true     ├──────────────┐
-│            k: 2           │              │
+│            k: 2           ├──────────────┐
 │         nprobe: 64        │              │
 │        query_dim: 2       │              │
 │                           │              │
@@ -24,9 +22,9 @@ expression: tree_str
 ┌─────────────┴─────────────┐┌─────────────┴─────────────┐
 │    VectorIndexScanExec    ││         FilterExec        │
 │    --------------------   ││    --------------------   │
-│        column: vec        ││     predicate: id >= 3    │
-│         nprobe: 64        ││                           │
-│        query_dim: 2       ││                           │
+│     candidate_rows: 6     ││     predicate: id >= 3    │
+│          files: 1         ││                           │
+│      files_scanned: 1     ││                           │
 │                           ││                           │
 │     vector_index_scan     ││                           │
 └───────────────────────────┘└─────────────┬─────────────┘
