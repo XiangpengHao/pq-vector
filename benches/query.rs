@@ -154,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = VectorTopKOptions {
         nprobe,
         max_candidates: args.max_candidates,
+        ..VectorTopKOptions::default()
     };
     let indexed_paths = [inplace_path, rewrite_path];
     for (idx, path) in indexed_paths.into_iter().enumerate() {
