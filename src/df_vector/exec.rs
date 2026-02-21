@@ -28,10 +28,12 @@ use futures::stream;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 
 use super::access::{
-    CandidateCursor, FileEntry, ParquetScanInfo, build_access_plans, gather_single_parquet_scan,
+    CandidateCursor, FileEntry, ParquetScanInfo, build_access_plans, gather_parquet_scans,
     parquet_scan_files, rewrite_with_access_plans,
 };
-use super::index_exec::{INDEX_PATH_COL, INDEX_ROW_ID_COL, VectorIndexScanExec};
+use super::index_exec::{
+    INDEX_PATH_COL, INDEX_ROW_ID_COL, INDEX_STORE_URL_COL, VectorIndexScanExec,
+};
 use super::options::VectorTopKOptions;
 
 /// Execution plan for VectorTopK.
@@ -85,10 +87,16 @@ impl VectorTopKExec {
         k: usize,
         options: VectorTopKOptions,
     ) -> Result<Self> {
-        let scan_info = gather_single_parquet_scan(&scan_plan)?.ok_or_else(|| {
-            DataFusionError::Plan("VectorTopKExec requires a single parquet scan input".to_string())
-        })?;
-        let files = parquet_scan_files(&scan_info);
+        let scan_infos = gather_parquet_scans(&scan_plan)?;
+        if scan_infos.is_empty() {
+            return Err(DataFusionError::Plan(
+                "VectorTopKExec requires at least one parquet scan input".to_string(),
+            ));
+        }
+        let files = scan_infos
+            .iter()
+            .flat_map(parquet_scan_files)
+            .collect::<Vec<_>>();
         let index_plan = Arc::new(VectorIndexScanExec::new(
             files,
             vector_column.clone(),
@@ -108,9 +116,9 @@ impl VectorTopKExec {
     async fn collect_candidates(
         &self,
         context: Arc<TaskContext>,
-    ) -> Result<HashMap<String, Vec<u32>>> {
+    ) -> Result<HashMap<(String, String), Vec<u32>>> {
         let batches = collect(self.index_plan.clone(), context).await?;
-        let mut selections: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut selections: HashMap<(String, String), Vec<u32>> = HashMap::new();
         for batch in batches {
             let object_paths = batch
                 .column_by_name(INDEX_PATH_COL)
@@ -126,6 +134,22 @@ impl VectorTopKExec {
                     DataFusionError::Internal(format!(
                         "VectorIndexScanExec output column '{}' must be Utf8",
                         INDEX_PATH_COL
+                    ))
+                })?;
+            let object_store_urls = batch
+                .column_by_name(INDEX_STORE_URL_COL)
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "VectorIndexScanExec output missing column '{}'",
+                        INDEX_STORE_URL_COL
+                    ))
+                })?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "VectorIndexScanExec output column '{}' must be Utf8",
+                        INDEX_STORE_URL_COL
                     ))
                 })?;
             let row_ids = batch
@@ -146,7 +170,10 @@ impl VectorTopKExec {
                 })?;
             for row in 0..batch.num_rows() {
                 selections
-                    .entry(object_paths.value(row).to_string())
+                    .entry((
+                        object_store_urls.value(row).to_string(),
+                        object_paths.value(row).to_string(),
+                    ))
                     .or_default()
                     .push(row_ids.value(row));
             }
@@ -156,45 +183,48 @@ impl VectorTopKExec {
 
     async fn files_with_candidates(
         &self,
-        scan: &ParquetScanInfo,
+        scans: &[ParquetScanInfo],
         context: Arc<TaskContext>,
-        mut candidate_rows: HashMap<String, Vec<u32>>,
+        mut candidate_rows: HashMap<(String, String), Vec<u32>>,
     ) -> Result<Vec<FileEntry>> {
         let mut files = Vec::new();
-        for scan_file in parquet_scan_files(scan) {
-            let location = ObjectStorePath::parse(&scan_file.object_path).map_err(|err| {
-                DataFusionError::Execution(format!(
-                    "Invalid object-store path '{}': {}",
-                    scan_file.object_path, err
-                ))
-            })?;
-            let store = context
-                .runtime_env()
-                .object_store(scan_file.object_store_url.clone())?;
-            let mut reader =
-                ParquetObjectReader::new(store, location).with_file_size(scan_file.file_size);
-            if let Some(hint) = scan_file.metadata_size_hint {
-                reader = reader.with_footer_size_hint(hint);
+        for scan in scans {
+            for scan_file in parquet_scan_files(scan) {
+                let location = ObjectStorePath::parse(&scan_file.object_path).map_err(|err| {
+                    DataFusionError::Execution(format!(
+                        "Invalid object-store path '{}': {}",
+                        scan_file.object_path, err
+                    ))
+                })?;
+                let store = context
+                    .runtime_env()
+                    .object_store(scan_file.object_store_url.clone())?;
+                let mut reader =
+                    ParquetObjectReader::new(store, location).with_file_size(scan_file.file_size);
+                if let Some(hint) = scan_file.metadata_size_hint {
+                    reader = reader.with_footer_size_hint(hint);
+                }
+                let metadata = reader.get_metadata(None).await.map_err(|err| {
+                    DataFusionError::Execution(format!(
+                        "Failed to read parquet metadata from '{}': {}",
+                        scan_file.object_path, err
+                    ))
+                })?;
+                let row_groups = metadata
+                    .row_groups()
+                    .iter()
+                    .map(|rg| rg.num_rows() as u64)
+                    .collect::<Vec<_>>();
+                let candidates = candidate_rows
+                    .remove(&(scan_file.object_store_url.to_string(), scan_file.object_path.clone()))
+                    .unwrap_or_default();
+                files.push(FileEntry {
+                    object_store_url: scan_file.object_store_url.clone(),
+                    object_path: scan_file.object_path,
+                    row_groups,
+                    candidates,
+                });
             }
-            let metadata = reader.get_metadata(None).await.map_err(|err| {
-                DataFusionError::Execution(format!(
-                    "Failed to read parquet metadata from '{}': {}",
-                    scan_file.object_path, err
-                ))
-            })?;
-            let row_groups = metadata
-                .row_groups()
-                .iter()
-                .map(|rg| rg.num_rows() as u64)
-                .collect::<Vec<_>>();
-            let candidates = candidate_rows
-                .remove(&scan_file.object_path)
-                .unwrap_or_default();
-            files.push(FileEntry {
-                object_path: scan_file.object_path,
-                row_groups,
-                candidates,
-            });
         }
         if !candidate_rows.is_empty() {
             return Err(DataFusionError::Internal(
@@ -230,10 +260,13 @@ impl VectorTopKExec {
         }
         let selected = cursor.next_batch(target_candidates);
 
-        let mut selections: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut selections: HashMap<(String, String), Vec<u32>> = HashMap::new();
         for (file_idx, row) in selected {
             selections
-                .entry(file_entries[file_idx].object_path.clone())
+                .entry((
+                    file_entries[file_idx].object_store_url.to_string(),
+                    file_entries[file_idx].object_path.clone(),
+                ))
                 .or_default()
                 .push(row);
         }
@@ -281,12 +314,15 @@ impl VectorTopKExec {
         context: Arc<TaskContext>,
         metrics: &VectorTopKMetricHandles,
     ) -> Result<RecordBatch> {
-        let scan_info = gather_single_parquet_scan(&self.scan_plan)?.ok_or_else(|| {
-            DataFusionError::Plan("VectorTopKExec requires a single parquet scan input".to_string())
-        })?;
+        let scan_infos = gather_parquet_scans(&self.scan_plan)?;
+        if scan_infos.is_empty() {
+            return Err(DataFusionError::Plan(
+                "VectorTopKExec requires at least one parquet scan input".to_string(),
+            ));
+        }
         let candidate_rows = self.collect_candidates(context.clone()).await?;
         let file_entries = self
-            .files_with_candidates(&scan_info, context.clone(), candidate_rows)
+            .files_with_candidates(&scan_infos, context.clone(), candidate_rows)
             .await?;
         self.execute_with_candidates(&file_entries, context, metrics)
             .await

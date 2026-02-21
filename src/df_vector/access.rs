@@ -14,6 +14,7 @@ use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 
 #[derive(Clone)]
 pub(crate) struct FileEntry {
+    pub(crate) object_store_url: ObjectStoreUrl,
     pub(crate) object_path: String,
     pub(crate) row_groups: Vec<u64>,
     pub(crate) candidates: Vec<u32>,
@@ -43,6 +44,12 @@ pub(crate) fn gather_single_parquet_scan(
     Ok(Some(scans.remove(0)))
 }
 
+pub(crate) fn gather_parquet_scans(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<ParquetScanInfo>> {
+    let mut scans = Vec::new();
+    collect_parquet_scans(plan, &mut scans)?;
+    Ok(scans)
+}
+
 fn collect_parquet_scans(
     plan: &Arc<dyn ExecutionPlan>,
     scans: &mut Vec<ParquetScanInfo>,
@@ -64,17 +71,18 @@ fn collect_parquet_scans(
 
 pub(crate) fn rewrite_with_access_plans(
     plan: Arc<dyn ExecutionPlan>,
-    access_plans: &HashMap<String, ParquetAccessPlan>,
+    access_plans: &HashMap<(String, String), ParquetAccessPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>()
         && let Some((file_scan, _source)) = exec.downcast_to_file_source::<ParquetSource>()
     {
         let mut new_config = file_scan.clone();
+        let object_store_url = file_scan.object_store_url.to_string();
         let mut new_groups = Vec::with_capacity(new_config.file_groups.len());
         for group in &new_config.file_groups {
             let mut new_files = Vec::with_capacity(group.len());
             for file in group.files() {
-                let key = file.path().as_ref().to_string();
+                let key = (object_store_url.clone(), file.path().as_ref().to_string());
                 let plan = access_plans.get(&key);
                 let new_file = if let Some(plan) = plan {
                     file.clone().with_extensions(Arc::new(plan.clone()))
@@ -106,16 +114,20 @@ pub(crate) fn rewrite_with_access_plans(
 
 pub(crate) fn build_access_plans(
     files: &[FileEntry],
-    selections: &HashMap<String, Vec<u32>>,
-) -> Result<HashMap<String, ParquetAccessPlan>> {
+    selections: &HashMap<(String, String), Vec<u32>>,
+) -> Result<HashMap<(String, String), ParquetAccessPlan>> {
     let mut plans = HashMap::new();
     for entry in files {
+        let key = (
+            entry.object_store_url.to_string(),
+            entry.object_path.clone(),
+        );
         let rows = selections
-            .get(&entry.object_path)
+            .get(&key)
             .map(|r| r.as_slice())
             .unwrap_or(&[]);
         let plan = access_plan_for_rows(&entry.row_groups, rows)?;
-        plans.insert(entry.object_path.clone(), plan);
+        plans.insert(key, plan);
     }
     Ok(plans)
 }

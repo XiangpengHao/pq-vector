@@ -104,6 +104,64 @@ async fn vector_topk_end_to_end() -> datafusion::common::Result<()> {
 }
 
 #[tokio::test]
+async fn vector_topk_across_multiple_parquet_files() -> datafusion::common::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().join("table");
+    std::fs::create_dir(&table_path)?;
+    let path_a = table_path.join("a.parquet");
+    let path_b = table_path.join("b.parquet");
+
+    write_indexed_test_parquet(&path_a, 0, vec![vec![0.0, 0.0], vec![10.0, 10.0]])?;
+    write_indexed_test_parquet(&path_b, 2, vec![vec![0.1, 0.1], vec![0.2, 0.2]])?;
+
+    let options = VectorTopKOptions {
+        nprobe: 64,
+        max_candidates: None,
+    };
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(VectorTopKPhysicalOptimizerRule::new(options)))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+
+    ctx.register_parquet(
+        "t",
+        table_path.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let df = ctx
+        .sql(
+            "SELECT id, vec FROM t \
+             ORDER BY array_distance(vec, [0.0, 0.0]) \
+             LIMIT 3",
+        )
+        .await
+        .unwrap();
+
+    let batches = datafusion::physical_plan::collect(
+        df.clone().create_physical_plan().await?,
+        ctx.task_ctx(),
+    )
+    .await?;
+    let mut ids = Vec::new();
+    for batch in batches {
+        let id_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..id_array.len() {
+            ids.push(id_array.value(row));
+        }
+    }
+    assert_eq!(ids, vec![0, 2, 3]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn vector_topk_vldb_tree_snapshot() -> datafusion::common::Result<()> {
     let source_path = std::path::Path::new("data/vldb_2025.parquet");
     let indexed_path = std::path::Path::new("data/vldb_2025_indexed.parquet");
@@ -278,4 +336,40 @@ fn get_embedding_at_row(
     Err(datafusion::common::DataFusionError::Execution(
         "Row not found".to_string(),
     ))
+}
+
+fn write_indexed_test_parquet(
+    path: &std::path::Path,
+    start_id: i32,
+    vectors: Vec<Vec<f32>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "vec",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            false,
+        ),
+    ]));
+
+    let ids = Int32Array::from_iter_values(
+        (start_id..start_id + vectors.len() as i32).collect::<Vec<_>>(),
+    );
+    let vector_values = vectors
+        .into_iter()
+        .map(|row| Some(row.into_iter().map(Some).collect::<Vec<_>>()))
+        .collect::<Vec<_>>();
+    let vectors = ListArray::from_iter_primitive::<Float32Type, _, _>(vector_values);
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(ids), Arc::new(vectors)],
+    )?;
+
+    let file = std::fs::File::create(path)?;
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    IndexBuilder::new(path, "vec").build_inplace()?;
+    Ok(())
 }

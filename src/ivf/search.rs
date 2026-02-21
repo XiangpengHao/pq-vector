@@ -8,11 +8,24 @@ use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone)]
+struct FileIndex {
+    path: PathBuf,
+    dim: EmbeddingDim,
+}
+
 // For max-heap (we want to pop largest distances).
 #[derive(Debug, Clone)]
 struct HeapItem {
     row_idx: u32,
     distance: f32,
+}
+
+#[derive(Debug)]
+struct MergeHeapItem {
+    distance: f32,
+    file_idx: usize,
+    result_idx: usize,
 }
 
 impl PartialEq for HeapItem {
@@ -37,11 +50,195 @@ impl Ord for HeapItem {
     }
 }
 
+impl PartialEq for MergeHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance
+    }
+}
+
+impl Eq for MergeHeapItem {}
+
+impl PartialOrd for MergeHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeHeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .distance
+            .partial_cmp(&self.distance)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
 /// Result item from top-k search.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub row_idx: u32,
     pub distance: f32,
+}
+
+/// Result item from top-k search across multiple files.
+#[derive(Debug, Clone)]
+pub struct MultiSearchResult {
+    pub file_path: PathBuf,
+    pub row_idx: u32,
+    pub distance: f32,
+}
+
+/// Multi-file IVF index referencing multiple indexed Parquet files.
+#[derive(Debug, Clone)]
+pub struct MultiFileIndex {
+    files: Vec<FileIndex>,
+}
+
+impl MultiFileIndex {
+    fn new(
+        paths: Vec<PathBuf>,
+        embedding_column: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if paths.is_empty() {
+            return Err("No parquet files provided".into());
+        }
+
+        let expected_embedding_column = EmbeddingColumn::try_from(embedding_column)?;
+        let mut files = Vec::with_capacity(paths.len());
+        let mut expected_dim: Option<EmbeddingDim> = None;
+
+        for path in paths {
+            let (index, file_embedding_column) = read_index_from_parquet(path.as_path())?;
+            if file_embedding_column != expected_embedding_column {
+                return Err(format!(
+                    "Embedding column mismatch in '{}': expected '{}', found '{}'",
+                    path.display(),
+                    expected_embedding_column.as_str(),
+                    file_embedding_column.as_str()
+                )
+                .into());
+            }
+
+            let dim = EmbeddingDim::new(index.dim())?;
+            if let Some(expected) = expected_dim {
+                if expected != dim {
+                    return Err(format!(
+                        "Embedding dimension mismatch in '{}': expected {}, found {}",
+                        path.display(),
+                        expected.as_usize(),
+                        dim.as_usize()
+                    )
+                    .into());
+                }
+            } else {
+                expected_dim = Some(dim);
+            }
+
+            files.push(FileIndex { path, dim });
+        }
+
+        Ok(Self { files })
+    }
+
+    pub async fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> Result<Vec<MultiSearchResult>, Box<dyn std::error::Error>> {
+        let k = NonZeroUsize::new(k).ok_or("k must be > 0")?;
+        let nprobe = NonZeroUsize::new(nprobe).ok_or("nprobe must be > 0")?;
+
+        let expected_dim = self.files[0].dim;
+        if query.len() != expected_dim.as_usize() {
+            return Err(format!(
+                "Query dimension mismatch: expected {}, got {}",
+                expected_dim.as_usize(),
+                query.len()
+            )
+            .into());
+        }
+
+        let mut per_file_results: Vec<Vec<SearchResult>> = Vec::with_capacity(self.files.len());
+        for file in &self.files {
+            let results = topk(file.path.as_path(), query, k, nprobe).await?;
+            per_file_results.push(results);
+        }
+
+        let mut heap: BinaryHeap<MergeHeapItem> = BinaryHeap::new();
+        let mut total_results = 0usize;
+        for (file_idx, results) in per_file_results.iter().enumerate() {
+            total_results += results.len();
+            if let Some(first) = results.first() {
+                heap.push(MergeHeapItem {
+                    distance: first.distance,
+                    file_idx,
+                    result_idx: 0,
+                });
+            }
+        }
+
+        let mut merged = Vec::with_capacity(k.get().min(total_results));
+        while merged.len() < k.get() {
+            let item = match heap.pop() {
+                Some(item) => item,
+                None => break,
+            };
+
+            let result = &per_file_results[item.file_idx][item.result_idx];
+            merged.push(MultiSearchResult {
+                file_path: self.files[item.file_idx].path.clone(),
+                row_idx: result.row_idx,
+                distance: result.distance,
+            });
+
+            let next_idx = item.result_idx + 1;
+            if next_idx < per_file_results[item.file_idx].len() {
+                let next = &per_file_results[item.file_idx][next_idx];
+                heap.push(MergeHeapItem {
+                    distance: next.distance,
+                    file_idx: item.file_idx,
+                    result_idx: next_idx,
+                });
+            }
+        }
+
+        Ok(merged)
+    }
+}
+
+/// Builder for a multi-file IVF index.
+#[derive(Debug, Clone)]
+pub struct MultiFileIndexBuilder {
+    files: Vec<PathBuf>,
+    embedding_column: String,
+}
+
+impl MultiFileIndexBuilder {
+    pub fn new(embedding_column: impl AsRef<str>) -> Self {
+        Self {
+            files: Vec::new(),
+            embedding_column: embedding_column.as_ref().to_string(),
+        }
+    }
+
+    pub fn add_file(mut self, path: impl AsRef<Path>) -> Self {
+        self.files.push(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Build IVF indexes in-place for all configured files.
+    pub fn build_indexes_inplace(&self) -> Result<(), Box<dyn std::error::Error>> {
+        for file in &self.files {
+            super::parquet::IndexBuilder::new(file.as_path(), self.embedding_column.as_str())
+                .build_inplace()?;
+        }
+        Ok(())
+    }
+
+    pub fn build(self) -> Result<MultiFileIndex, Box<dyn std::error::Error>> {
+        MultiFileIndex::new(self.files, self.embedding_column.as_str())
+    }
 }
 
 /// Builder for top-k nearest neighbor search.
@@ -241,4 +438,136 @@ async fn read_embeddings_for_rows(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MultiFileIndexBuilder;
+    use crate::ivf::IndexBuilder;
+    use arrow::array::types::Float32Type;
+    use arrow::array::{Array, Int32Array, ListArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn build_indexed_file(
+        path: &std::path::Path,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vec",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                false,
+            ),
+        ]));
+
+        let ids = Int32Array::from_iter_values(0..(vectors.len() as i32));
+        let vector_values = vectors
+            .into_iter()
+            .map(|row| Some(row.into_iter().map(Some).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        let vectors = ListArray::from_iter_primitive::<Float32Type, _, _>(vector_values);
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vectors)])?;
+
+        let file = std::fs::File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        IndexBuilder::new(path, "vec").build_inplace()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_file_index_search_merges_results() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
+        let file_a = temp_dir.path().join("a.parquet");
+        let file_b = temp_dir.path().join("b.parquet");
+
+        build_indexed_file(&file_a, vec![vec![0.0, 0.0], vec![2.0, 2.0]])?;
+        build_indexed_file(&file_b, vec![vec![0.1, 0.1], vec![0.2, 0.2]])?;
+
+        let index = MultiFileIndexBuilder::new("vec")
+            .add_file(&file_a)
+            .add_file(&file_b)
+            .build()?;
+
+        let results = index.search(&[0.0, 0.0], 3, 64).await?;
+        let expected: Vec<(std::path::PathBuf, u32)> = vec![
+            (file_a.clone(), 0),
+            (file_b.clone(), 0),
+            (file_b.clone(), 1),
+        ];
+
+        let actual: Vec<(std::path::PathBuf, u32)> = results
+            .into_iter()
+            .map(|item| (item.file_path, item.row_idx))
+            .collect();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn multi_file_index_builder_rejects_empty_file_list() {
+        let result = MultiFileIndexBuilder::new("vec").build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn multi_file_index_builder_rejects_different_embedding_columns() {
+        let temp_dir = TempDir::new().unwrap();
+        let first = temp_dir.path().join("first.parquet");
+        let second = temp_dir.path().join("second.parquet");
+
+        build_alt_column_file(first.as_path(), "vec", vec![vec![0.0, 0.0], vec![1.0, 1.0]])
+            .unwrap();
+        build_alt_column_file(
+            second.as_path(),
+            "embedding",
+            vec![vec![0.0, 0.0], vec![1.0, 1.0]],
+        )
+        .unwrap();
+
+        let result = MultiFileIndexBuilder::new("vec")
+            .add_file(first)
+            .add_file(second)
+            .build();
+        assert!(result.is_err());
+    }
+
+    fn build_alt_column_file(
+        path: &std::path::Path,
+        column: &str,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                column,
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                false,
+            ),
+        ]));
+
+        let ids = Int32Array::from_iter_values(0..(vectors.len() as i32));
+        let vector_values = vectors
+            .into_iter()
+            .map(|row| Some(row.into_iter().map(Some).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        let vectors = ListArray::from_iter_primitive::<Float32Type, _, _>(vector_values);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vectors)])?;
+
+        let file = std::fs::File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        IndexBuilder::new(path, column).build_inplace()?;
+        Ok(())
+    }
 }
