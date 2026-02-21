@@ -29,9 +29,11 @@ use super::access::ScanFile;
 use super::options::VectorTopKOptions;
 
 pub(crate) const INDEX_PATH_COL: &str = "pq_vector_object_path";
+pub(crate) const INDEX_STORE_URL_COL: &str = "pq_vector_object_store_url";
 pub(crate) const INDEX_ROW_ID_COL: &str = "pq_vector_row_id";
 
 struct IndexFileCandidates {
+    object_store_url: String,
     object_path: String,
     candidates: Vec<u32>,
 }
@@ -58,6 +60,7 @@ impl VectorIndexScanExec {
     ) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new(INDEX_PATH_COL, DataType::Utf8, false),
+            Field::new(INDEX_STORE_URL_COL, DataType::Utf8, false),
             Field::new(INDEX_ROW_ID_COL, DataType::UInt32, false),
         ]));
         let cache = PlanProperties::new(
@@ -84,6 +87,7 @@ impl VectorIndexScanExec {
         let mut files = Vec::new();
         for file in self.files.iter() {
             let object_path = file.object_path.clone();
+            let object_store_url = file.object_store_url.to_string();
             let location = ObjectStorePath::parse(&object_path).map_err(|err| {
                 DataFusionError::Execution(format!(
                     "Invalid object-store path '{}': {}",
@@ -158,6 +162,7 @@ impl VectorIndexScanExec {
             }
 
             files.push(IndexFileCandidates {
+                object_store_url,
                 object_path,
                 candidates: index.candidate_rows(&self.query, self.options.nprobe),
             });
@@ -169,10 +174,13 @@ impl VectorIndexScanExec {
 
         let total_rows = files.iter().map(|f| f.candidates.len()).sum::<usize>();
         let mut paths = Vec::with_capacity(total_rows);
+        let mut stores = Vec::with_capacity(total_rows);
         let mut row_ids = Vec::with_capacity(total_rows);
         for file in files {
+            let object_store_url = file.object_store_url.clone();
             for row in file.candidates {
                 paths.push(file.object_path.clone());
+                stores.push(object_store_url.clone());
                 row_ids.push(row);
             }
         }
@@ -181,6 +189,7 @@ impl VectorIndexScanExec {
             self.schema.clone(),
             vec![
                 Arc::new(StringArray::from(paths)),
+                Arc::new(StringArray::from(stores)),
                 Arc::new(UInt32Array::from(row_ids)),
             ],
         )
