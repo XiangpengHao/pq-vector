@@ -5,7 +5,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, StringArray, UInt32Array};
+use arrow::array::{Array, Float32Array, Float64Array, ListArray, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result, assert_eq_or_internal_err};
 use datafusion::execution::TaskContext;
@@ -22,11 +22,24 @@ use datafusion::physical_plan::{
 };
 use futures::stream;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::ProjectionMask;
 
-use crate::ivf::{read_index_from_payload, read_index_metadata_from_file_metadata};
+use crate::hnsw::{
+    read_index_from_payload as read_hnsw_index_from_payload, HnswIndex,
+};
+use crate::ivf::{
+    read_index_from_payload, read_index_metadata_from_file_metadata, EmbeddingColumn, EmbeddingDim,
+    Embeddings,
+};
 
 use super::access::ScanFile;
 use super::options::VectorTopKOptions;
+
+enum ParsedIndex {
+    Ivf(crate::ivf::IvfIndex),
+    Hnsw(HnswIndex),
+}
 
 pub(crate) const INDEX_PATH_COL: &str = "pq_vector_object_path";
 pub(crate) const INDEX_ROW_ID_COL: &str = "pq_vector_row_id";
@@ -141,25 +154,52 @@ impl VectorIndexScanExec {
                     object_path, err
                 ))
             })?;
-            let (index, _) =
-                read_index_from_payload(payload.as_ref(), embedding_column).map_err(|err| {
+            let index = parse_index_payload(payload.as_ref(), &embedding_column).map_err(|err| {
                     DataFusionError::Execution(format!(
                         "Failed to decode pq-vector payload from '{}': {}",
                         object_path, err
                     ))
                 })?;
 
-            if index.dim() != self.query.len() {
+            let (candidates, index_dim) = match index {
+                ParsedIndex::Ivf(index) => (
+                    index.candidate_rows(&self.query, self.options.nprobe),
+                    index.dim(),
+                ),
+                ParsedIndex::Hnsw(index) => {
+                    let all_embeddings = read_all_embeddings(
+                        &object_path,
+                        file.file_size,
+                        &store,
+                        file.metadata_size_hint,
+                        embedding_column.as_str(),
+                    )
+                    .await?;
+                    if all_embeddings.dim().as_usize() != self.query.len() {
+                        return Err(DataFusionError::Plan(format!(
+                            "Embedding dimension mismatch: expected {}, got {}",
+                            all_embeddings.dim().as_usize(),
+                            self.query.len()
+                        )));
+                    }
+                    (
+                        index.candidate_rows(&self.query, all_embeddings.data(), self.options.nprobe),
+                        index.dim(),
+                    )
+                }
+            };
+
+            if index_dim != self.query.len() {
                 return Err(DataFusionError::Plan(format!(
                     "Query dimension mismatch: expected {}, got {}",
-                    index.dim(),
+                    index_dim,
                     self.query.len()
                 )));
             }
 
             files.push(IndexFileCandidates {
                 object_path,
-                candidates: index.candidate_rows(&self.query, self.options.nprobe),
+                candidates,
             });
         }
 
@@ -297,4 +337,142 @@ impl VectorIndexScanMetricHandles {
                 .counter("candidate_rows", partition),
         }
     }
+}
+
+fn parse_index_payload(
+    payload: &[u8],
+    embedding_column: &EmbeddingColumn,
+) -> Result<ParsedIndex, Box<dyn std::error::Error>> {
+    if let Ok((index, _)) = read_index_from_payload(payload, embedding_column.clone()) {
+        return Ok(ParsedIndex::Ivf(index));
+    }
+    let (index, _) = read_hnsw_index_from_payload(payload, embedding_column.clone())?;
+    Ok(ParsedIndex::Hnsw(index))
+}
+
+async fn read_all_embeddings(
+    object_path: &str,
+    file_size: u64,
+    store: &std::sync::Arc<dyn datafusion::object_store::ObjectStore>,
+    metadata_size_hint: Option<usize>,
+    embedding_column: &str,
+) -> Result<Embeddings, DataFusionError> {
+    let location = ObjectStorePath::parse(object_path).map_err(|err| {
+        DataFusionError::Execution(format!(
+            "Invalid object-store path '{}': {}",
+            object_path, err
+        ))
+    })?;
+
+    let mut reader = ParquetObjectReader::new(store.clone(), location).with_file_size(file_size);
+    if let Some(hint) = metadata_size_hint {
+        reader = reader.with_footer_size_hint(hint);
+    }
+
+    let options = ArrowReaderOptions::new().with_page_index(true);
+    let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new_with_options(
+        reader, options,
+    )
+    .await?;
+
+    let schema = builder.schema();
+    let embedding_col_idx = schema
+        .fields()
+        .iter()
+        .position(|field| field.name() == embedding_column)
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("Embedding column '{}' not found", embedding_column))
+        })?;
+    let projection = ProjectionMask::roots(builder.parquet_schema(), [embedding_col_idx]);
+    use futures::StreamExt;
+    let mut stream = builder.with_projection(projection).build()?;
+
+    let mut dim = None;
+    let mut all_embeddings = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let embedding_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution("Embedding column is not a list array".to_string())
+            })?;
+        if embedding_col.null_count() > 0 {
+            return Err(DataFusionError::Execution(
+                "Embedding column contains null rows".to_string(),
+            ));
+        }
+
+        let values = embedding_col.values();
+        enum FloatValues<'a> {
+            F32(&'a Float32Array),
+            F64(&'a Float64Array),
+        }
+        let float_values = if let Some(array) = values.as_any().downcast_ref::<Float32Array>() {
+            FloatValues::F32(array)
+        } else if let Some(array) = values.as_any().downcast_ref::<Float64Array>() {
+            FloatValues::F64(array)
+        } else {
+            return Err(DataFusionError::Execution(
+                "Embedding values are not float32/float64".to_string(),
+            ));
+        };
+
+        if match &float_values {
+            FloatValues::F32(array) => array.null_count(),
+            FloatValues::F64(array) => array.null_count(),
+        } > 0
+        {
+            return Err(DataFusionError::Execution(
+                "Embedding values contain nulls".to_string(),
+            ));
+        }
+
+        for row in 0..embedding_col.len() {
+            let row_len = embedding_col.value_length(row) as usize;
+            if row_len == 0 {
+                return Err(DataFusionError::Execution(
+                    "Embedding row has zero length".to_string(),
+                ));
+            }
+            let row_dim = EmbeddingDim::new(row_len).map_err(|err| {
+                DataFusionError::Execution(format!(
+                    "Embedding vector has invalid row length {}: {}",
+                    row_len, err
+                ))
+            })?;
+            if let Some(existing) = dim {
+                if existing != row_dim {
+                    return Err(DataFusionError::Execution(
+                        "Embedding vectors have inconsistent dimensions".to_string(),
+                    ));
+                }
+            } else {
+                dim = Some(row_dim);
+            }
+            let offsets = embedding_col.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            match &float_values {
+                FloatValues::F32(values) => {
+                    for i in start..end {
+                        all_embeddings.push(values.value(i));
+                    }
+                }
+                FloatValues::F64(values) => {
+                    for i in start..end {
+                        all_embeddings.push(values.value(i) as f32);
+                    }
+                }
+            }
+        }
+    }
+
+    let dim = dim.ok_or_else(|| {
+        DataFusionError::Execution("Embedding column has no rows".to_string())
+    })?;
+
+    Embeddings::new(all_embeddings, dim)
+        .map_err(|err| DataFusionError::Execution(err.to_string()))
 }
