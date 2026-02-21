@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = VectorTopKOptions {
         nprobe: 8,
         max_candidates: None,
+        ..VectorTopKOptions::default()
     };
     let state = SessionStateBuilder::new()
         .with_default_features()

@@ -13,6 +13,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
 use super::access::gather_single_parquet_scan;
+use super::filter::{FilterStrategy, rewrap_filters, select_filter_strategy, split_filter_chain};
 use super::exec::VectorTopKExec;
 use super::expr::scalar_to_f32_list;
 use super::options::VectorTopKOptions;
@@ -146,7 +147,12 @@ impl VectorTopKPhysicalOptimizerRule {
         let Some((column, query_vector)) = extract_array_distance_physical(&sort_expr.expr) else {
             return Ok(None);
         };
-        let Some(scan) = gather_single_parquet_scan(sort.input())? else {
+        let (filters, unfiltered_scan_input) = split_filter_chain(sort.input());
+        let filter_strategy = select_filter_strategy(&filters, &self.options);
+        let Some(scan) = (match filter_strategy {
+            FilterStrategy::PreFilter => gather_single_parquet_scan(sort.input())?,
+            FilterStrategy::PostFilter => gather_single_parquet_scan(&unfiltered_scan_input)?,
+        }) else {
             return Ok(None);
         };
         if scan
@@ -167,13 +173,28 @@ impl VectorTopKPhysicalOptimizerRule {
                 fetch
             }
         };
-        Ok(Some(Arc::new(VectorTopKExec::try_new(
-            sort.input().clone(),
+        let fetch_k = if filter_strategy == FilterStrategy::PostFilter {
+            k.saturating_mul(5)
+        } else {
+            k
+        };
+        let scan_plan = match filter_strategy {
+            FilterStrategy::PreFilter => sort.input().clone(),
+            FilterStrategy::PostFilter => unfiltered_scan_input.clone(),
+        };
+        let topk = Arc::new(VectorTopKExec::try_new(
+            scan_plan,
             column,
             query_vector,
-            k,
+            fetch_k,
             self.options.clone(),
-        )?)))
+        )?);
+        if filter_strategy == FilterStrategy::PostFilter {
+            let filtered = rewrap_filters(topk, &filters)?;
+            let limited = GlobalLimitExec::new(filtered, 0, Some(k));
+            return Ok(Some(Arc::new(limited)));
+        }
+        Ok(Some(topk))
     }
 }
 
